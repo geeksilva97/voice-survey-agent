@@ -28,6 +28,11 @@ func main() {
 		"ans2.wav": "I love lavender and vanilla the most. Something warm and calming for the living room.",
 		"bail.wav":   "Actually, I need to go now. Thanks, but I don't have time for any more questions.",
 		"repeat.wav": "Sorry, I didn't catch that. What was the question again?",
+		// A calque / broken-English answer (candles): should classify as
+		// answer+unclear so the agent does a repair turn.
+		"calque.wav": "The candles are very perfumed and I liking too much, but honestly the price is a little salty for me.",
+		// A bare affirmation to resolve a repair turn (keeps the original answer).
+		"yes.wav": "Yes, exactly, that's what I meant.",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)

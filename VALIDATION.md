@@ -162,8 +162,10 @@ Harness files (committed, reusable):
 ### Prep (once)
 
 ```bash
-go run ./cmd/genclips          # writes web/static/demo/{ans0,ans1,ans2,bail}.wav
+go run ./cmd/genclips          # writes web/static/demo/{ans0,ans1,ans2,bail,repeat,calque,yes}.wav
 go run ./cmd/server            # http://localhost:8090
+# To exercise the repair turn, run the classifier on a stronger model:
+go run ./cmd/server -classify-model claude-sonnet-5
 ```
 
 ### Procedure (Chrome DevTools MCP, or any CDP driver / manual console)
@@ -189,13 +191,21 @@ go run ./cmd/server            # http://localhost:8090
 | **Happy path** | default `autoanswer.js` (answers every turn) | `completed` |
 | **Silence** | click Start, inject nothing, stay quiet | `silence` (one reprompt first) |
 | **Bail-out** | set `window.__answers = ['bail.wav']` before first listen | `bailed` |
+| **Repair (unclear)** | run server with `-classify-model claude-sonnet-5`; set `window.__answers = ['calque.wav','yes.wav','ans1.wav','ans2.wav']` | one confirm turn ("you said …, did I understand?"), then `completed`; **Q1 stores the calque, not "yes"** |
 | **Barge-in** | tick "Enable barge-in", play a clip during agent playback | playback stops; turn continues (headphones IRL) |
+
+> The repair turn only fires when the classifier flags an answer `unclear` — the
+> local 3B rarely does, so use `-classify-model claude-sonnet-5` (or a cloud
+> model) to see it.
 
 ### Last validated
 
 - **Happy path** — poll `4cebed5b6a`, 5 questions auto-answered, `end_reason=completed`.
 - **Silence** — poll `f080ec5d06`, no answer, one reprompt, `end_reason=silence`.
-  (both observed live in Chrome on 2026-07-21)
+- **Repair (unclear)** — poll `56a1299bd6`, classifier `claude-sonnet-5`, candles.
+  Calque answer ("very perfumed and I like too much… price is a little salty") →
+  agent confirmed verbatim → "yes exactly" → advanced. `end_reason=completed`,
+  and Q1 stored the calque (not the "yes"). (observed live in Chrome 2026-07-21)
 
 > Note: the greeting is a long clip and the silence window is 9s. When answering
 > manually, answer promptly or the silence backstop may fire first — the
