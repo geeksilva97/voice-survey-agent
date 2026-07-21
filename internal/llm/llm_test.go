@@ -38,6 +38,7 @@ func TestClassifyTurn(t *testing.T) {
 	}{
 		{"wants_stop", "Honestly I have to go now, I don't have time for this.", IntentWantsStop, false},
 		{"good_answer", "I really love the lavender one, it's so relaxing in the evenings.", IntentAnswer, true},
+		{"repeat", "Sorry, what was the question? I didn't catch it.", IntentRepeat, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,6 +49,9 @@ func TestClassifyTurn(t *testing.T) {
 			t.Logf("reply=%q -> %+v", tc.reply, got)
 			if tc.wantIntent == IntentWantsStop && got.Intent != IntentWantsStop {
 				t.Errorf("expected wants_stop, got %q", got.Intent)
+			}
+			if tc.wantIntent == IntentRepeat && got.Intent != IntentRepeat {
+				t.Errorf("expected repeat, got %q", got.Intent)
 			}
 			if tc.wantIntent == IntentAnswer {
 				if got.Intent != IntentAnswer {

@@ -26,7 +26,8 @@ func main() {
 		"ans0.wav": "I really like them. The scent is relaxing and they last a long time. I'd definitely recommend them to a friend.",
 		"ans1.wav": "I usually burn one in the evening while I'm reading, maybe three or four times a week.",
 		"ans2.wav": "I love lavender and vanilla the most. Something warm and calming for the living room.",
-		"bail.wav":  "Actually, I need to go now. Thanks, but I don't have time for any more questions.",
+		"bail.wav":   "Actually, I need to go now. Thanks, but I don't have time for any more questions.",
+		"repeat.wav": "Sorry, I didn't catch that. What was the question again?",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)

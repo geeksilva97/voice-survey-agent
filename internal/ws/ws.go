@@ -39,6 +39,7 @@ const (
 	inputSampleRate   = 16000            // browser captures/sends 16kHz mono
 	silenceWindow     = 12 * time.Second // how long to wait for a reply before nudging
 	maxSilenceStrikes = 2                // nudges before ending on silence
+	maxReasks         = 2                // times we re-read a question before moving on
 )
 
 var upgrader = websocket.Upgrader{
@@ -112,6 +113,7 @@ type conversation struct {
 
 	speaking bool // true while we expect the client to be playing audio
 	strikes  int  // consecutive silence nudges
+	reasks   int  // times we've re-read the current question
 }
 
 func (cv *conversation) run() {
@@ -228,6 +230,22 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		return true
 	}
 
+	// "Repeat / I didn't understand": re-read the current question verbatim
+	// (doesn't consume a follow-up or advance). Capped so it can't loop forever.
+	if turn.Intent == llm.IntentRepeat {
+		if cv.reasks < maxReasks {
+			cv.reasks++
+			idx, total := cv.sv.Progress()
+			msg := "Sure, here it is again. " + q.Text
+			cv.emit(outMsg{Type: "agent_say", Text: msg, Kind: "question", Index: idx, Total: total}, msg)
+			return false
+		}
+		// Asked too many times — skip this one and move on.
+		cv.sv.CaptureAndAdvance("")
+		cv.persist()
+		return cv.askNextOrFinish()
+	}
+
 	// A sufficient, on-topic answer: capture and advance.
 	if turn.Intent == llm.IntentAnswer && turn.Sufficient {
 		cv.sv.RecordAnswer(text)
@@ -237,7 +255,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 
 	// Weak / off-topic / unintelligible: probe once, then move on.
 	if cv.sv.FollowUp() {
-		cv.speak(followUpPrompt(turn.Intent), "followup")
+		cv.speak(followUpPrompt(turn.Intent, q.Text), "followup")
 		return false
 	}
 	// Follow-up budget spent: capture whatever we got and advance.
@@ -256,6 +274,7 @@ func (cv *conversation) askNextOrFinish() bool {
 	if !ok {
 		return cv.finishCompleted()
 	}
+	cv.reasks = 0 // new question — reset the re-ask counter
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
 	cv.speakQ(q.Text, idx, total)
@@ -396,13 +415,13 @@ func (cv *conversation) readLoop(events chan<- event) {
 	}
 }
 
-func followUpPrompt(intent llm.Intent) string {
+func followUpPrompt(intent llm.Intent, question string) string {
 	switch intent {
 	case llm.IntentOffTopic:
-		return "Got it — and coming back to my question, what are your thoughts?"
+		return "No problem — let me ask again. " + question
 	case llm.IntentUnintellig:
-		return "Sorry, I didn't quite catch that. Could you say it again?"
-	default:
+		return "Sorry, I didn't quite catch that. Here's the question again: " + question
+	default: // a vague but on-topic answer
 		return "Could you tell me a little more about that?"
 	}
 }

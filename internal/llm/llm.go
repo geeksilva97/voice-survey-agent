@@ -118,6 +118,7 @@ type Intent string
 const (
 	IntentAnswer     Intent = "answer"      // engaging with the question
 	IntentWantsStop  Intent = "wants_stop"  // wants to end the survey early
+	IntentRepeat     Intent = "repeat"      // didn't hear/understand; wants the question again
 	IntentOffTopic   Intent = "off_topic"   // not related to the question
 	IntentUnintellig Intent = "unintelligible"
 )
@@ -128,7 +129,7 @@ type Turn struct {
 	Sufficient bool   `json:"sufficient"` // did they actually answer the question?
 }
 
-var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","off_topic","unintelligible"]},"sufficient":{"type":"boolean"}},"required":["intent","sufficient"]}`)
+var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","repeat","off_topic","unintelligible"]},"sufficient":{"type":"boolean"}},"required":["intent","sufficient"]}`)
 
 // ClassifyTurn reads a respondent reply in the context of the current question.
 func (c *Client) ClassifyTurn(ctx context.Context, question, reply string) (Turn, error) {
@@ -139,7 +140,11 @@ func (c *Client) ClassifyTurn(ctx context.Context, question, reply string) (Turn
 	sys := "You classify a survey respondent's spoken reply. Decide the intent and " +
 		"whether it is a sufficient answer to the question. " +
 		"'wants_stop' means they want to end the survey (e.g. 'I have to go', 'I'm done', " +
-		"'stop', 'no more questions'). 'off_topic' means unrelated to the question. " +
+		"'stop', 'no more questions'). " +
+		"'repeat' means they did NOT hear or understand the question and want it repeated or " +
+		"clarified (e.g. 'what was the question?', 'can you repeat that?', 'I didn't catch it', " +
+		"'I don't understand'). " +
+		"'off_topic' means unrelated to the question. " +
 		"'answer' means they engaged with the question (even briefly). Be lenient: a short " +
 		"but on-point reply is sufficient. Respond ONLY as JSON."
 	user := fmt.Sprintf("Question: %s\nReply: %s", question, reply)
