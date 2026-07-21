@@ -1,0 +1,83 @@
+// Package session stores poll definitions and their captured answers. It keeps
+// everything in memory and also persists each poll to data/<id>.json so the
+// results view survives a restart and the demo has durable proof of capture.
+package session
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"voicesurvey/internal/survey"
+)
+
+// Poll is one created survey: its questions and (once answered) results.
+type Poll struct {
+	ID        string           `json:"id"`
+	Product   string           `json:"product"`
+	Questions []string         `json:"questions"`
+	CreatedAt time.Time        `json:"created_at"`
+	Survey    *survey.Survey   `json:"survey,omitempty"`
+	EndReason survey.EndReason `json:"end_reason,omitempty"`
+	EndedAt   *time.Time       `json:"ended_at,omitempty"`
+}
+
+// Store is a concurrency-safe collection of polls with JSON persistence.
+type Store struct {
+	mu   sync.RWMutex
+	dir  string
+	byID map[string]*Poll
+}
+
+// NewStore creates the store and its data directory.
+func NewStore(dir string) (*Store, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return &Store{dir: dir, byID: map[string]*Poll{}}, nil
+}
+
+// Create registers a new poll from a product description and question set.
+func (s *Store) Create(product string, questions []string) *Poll {
+	p := &Poll{
+		ID:        newID(),
+		Product:   product,
+		Questions: questions,
+		CreatedAt: time.Now(),
+		Survey:    survey.New(questions),
+	}
+	s.mu.Lock()
+	s.byID[p.ID] = p
+	s.mu.Unlock()
+	s.persist(p)
+	return p
+}
+
+// Get returns a poll by id.
+func (s *Store) Get(id string) (*Poll, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.byID[id]
+	return p, ok
+}
+
+// Save flushes a poll to disk (call after answers change or it ends).
+func (s *Store) Save(p *Poll) { s.persist(p) }
+
+func (s *Store) persist(p *Poll) {
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(s.dir, p.ID+".json"), b, 0o644)
+}
+
+func newID() string {
+	b := make([]byte, 5)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}

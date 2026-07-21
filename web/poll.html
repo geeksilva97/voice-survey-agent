@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Survey</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1420; --card:#1a2233; --fg:#e8edf6; --mut:#93a1b8; --acc:#6ea8fe; --ok:#4cd07d; --line:#2a3550; }
+  @media (prefers-color-scheme: light){ :root{ --bg:#f4f6fb; --card:#fff; --fg:#16202e; --mut:#5a6b83; --acc:#2f6fed; --ok:#1a9e54; --line:#e2e8f2; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  .wrap { max-width:620px; margin:0 auto; padding:40px 20px; min-height:100vh; display:flex; flex-direction:column; }
+  .top { display:flex; align-items:center; justify-content:space-between; color:var(--mut); font-size:.85rem; }
+  .bar { height:6px; background:var(--line); border-radius:99px; margin:14px 0 30px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0; background:var(--acc); transition:width .4s; }
+  .orb { width:132px; height:132px; border-radius:50%; margin:20px auto; background:radial-gradient(circle at 40% 35%, var(--acc), #24406e); box-shadow:0 0 0 0 rgba(110,168,254,.5); transition:transform .2s; }
+  .orb.speaking { animation:pulse 1.6s ease-in-out infinite; }
+  .orb.listening { background:radial-gradient(circle at 40% 35%, var(--ok), #16603a); animation:listen 1.4s ease-in-out infinite; }
+  .orb.thinking { opacity:.7; animation:spin 1.2s linear infinite; }
+  @keyframes pulse { 0%,100%{ box-shadow:0 0 0 0 rgba(110,168,254,.45);} 50%{ box-shadow:0 0 0 26px rgba(110,168,254,0);} }
+  @keyframes listen { 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.08);} }
+  @keyframes spin { to { transform:rotate(360deg);} }
+  .status { text-align:center; color:var(--mut); min-height:1.4em; font-size:.95rem; letter-spacing:.02em; }
+  .caption { text-align:center; font-size:1.35rem; font-weight:600; margin:8px 0 4px; min-height:2.6em; }
+  .heard { text-align:center; color:var(--mut); font-style:italic; min-height:1.4em; }
+  .center { flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .start { display:block; margin:0 auto; padding:15px 30px; border:0; border-radius:12px; background:var(--acc); color:#fff; font-weight:700; font-size:1.05rem; cursor:pointer; }
+  .foot { text-align:center; color:var(--mut); font-size:.8rem; margin-top:20px; }
+  .foot label { cursor:pointer; }
+  .done { text-align:center; }
+  .done a { color:var(--acc); }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <span>Voice Survey</span>
+    <span id="progress"></span>
+  </div>
+  <div class="bar"><i id="barfill"></i></div>
+
+  <div class="center">
+    <div id="pre">
+      <p style="text-align:center; color:var(--mut)">Put on headphones for the best experience. When you're ready, we'll ask a few quick questions — just answer out loud.</p>
+      <button class="start" id="start">🎙️ Start &amp; allow microphone</button>
+      <div class="foot"><label><input type="checkbox" id="bargein"> Enable barge-in (talk over the agent — headphones required)</label></div>
+    </div>
+
+    <div id="live" class="hidden">
+      <div class="orb" id="orb"></div>
+      <div class="caption" id="caption"></div>
+      <div class="status" id="status"></div>
+      <div class="heard" id="heard"></div>
+    </div>
+
+    <div id="ended" class="hidden done">
+      <div class="caption" id="endmsg"></div>
+      <p class="foot">You can close this tab now.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Silero VAD in the browser (ONNX Runtime Web + @ricky0123/vad-web).
+     0.0.22 pins its own CDN asset paths (worklet, Silero model, ORT wasm),
+     so everything auto-loads from jsdelivr with no local hosting. -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+<script src="/static/js/client.js"></script>
+</body>
+</html>

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Survey — Results</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1420; --card:#1a2233; --fg:#e8edf6; --mut:#93a1b8; --acc:#6ea8fe; --ok:#4cd07d; --warn:#e0b64c; --line:#2a3550; }
+  @media (prefers-color-scheme: light){ :root{ --bg:#f4f6fb; --card:#fff; --fg:#16202e; --mut:#5a6b83; --acc:#2f6fed; --ok:#1a9e54; --warn:#a67c15; --line:#e2e8f2; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  .wrap { max-width:720px; margin:0 auto; padding:44px 20px; }
+  h1 { font-size:1.5rem; margin:0 0 2px; }
+  .meta { color:var(--mut); margin:0 0 24px; font-size:.9rem; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:99px; font-size:.78rem; font-weight:700; }
+  .b-completed { background:rgba(76,208,125,.18); color:var(--ok); }
+  .b-bailed, .b-silence { background:rgba(224,182,76,.18); color:var(--warn); }
+  .b-pending { background:var(--line); color:var(--mut); }
+  .qa { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin:12px 0; }
+  .q { font-weight:600; }
+  .a { margin-top:6px; color:var(--fg); }
+  .a.empty { color:var(--mut); font-style:italic; }
+  .tag { float:right; font-size:.72rem; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
+  .err { color:#ff6b6b; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">Results</h1>
+  <p class="meta" id="meta"></p>
+  <div id="list"></div>
+  <p class="err" id="err"></p>
+</div>
+<script>
+const id = location.pathname.split("/").pop();
+(async () => {
+  try {
+    const r = await fetch("/api/polls/" + id);
+    if (!r.ok) throw new Error(r.statusText);
+    const p = await r.json();
+    document.getElementById("title").textContent = "Results — " + p.product;
+
+    const reason = p.end_reason || "pending";
+    const label = { completed:"Completed", bailed:"Ended early", silence:"Timed out", pending:"Not taken yet" }[reason] || reason;
+    document.getElementById("meta").innerHTML =
+      `<span class="badge b-${reason}">${label}</span> &nbsp; created ${new Date(p.created_at).toLocaleString()}`;
+
+    const qs = (p.survey && p.survey.questions) ? p.survey.questions
+             : (p.questions || []).map(t => ({ text:t, status:"unasked", answer:"" }));
+    const list = document.getElementById("list");
+    qs.forEach((q, i) => {
+      const div = document.createElement("div");
+      div.className = "qa";
+      const answered = q.answer && q.answer.trim();
+      div.innerHTML =
+        `<span class="tag">${q.status}</span>` +
+        `<div class="q">${i+1}. ${escapeHtml(q.text)}</div>` +
+        (answered ? `<div class="a">${escapeHtml(q.answer)}</div>`
+                  : `<div class="a empty">— no answer —</div>`);
+      list.appendChild(div);
+    });
+  } catch (e) {
+    document.getElementById("err").textContent = "Could not load results: " + e.message;
+  }
+})();
+function escapeHtml(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+</script>
+</body>
+</html>

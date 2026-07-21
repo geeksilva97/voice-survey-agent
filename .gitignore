@@ -1,0 +1,6 @@
+/models/
+/bin/
+/spike
+/server
+*.wav
+data/
