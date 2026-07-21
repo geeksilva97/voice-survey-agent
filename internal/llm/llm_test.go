@@ -64,3 +64,38 @@ func TestClassifyTurn(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyQuirkyAnswer is a regression test: an unexpected-but-on-topic
+// suggestion must be a sufficient answer, not off_topic. Real bug: "a banana
+// vitamin would be awesome" for a drinks question was flagged off_topic, so the
+// agent re-read an already-answered question.
+func TestClassifyQuirkyAnswer(t *testing.T) {
+	if !ollamaUp() {
+		t.Skip("ollama not running on :11434")
+	}
+	c, err := New("qwen2.5:3b")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Each reply is genuinely ON-TOPIC for its paired question, just quirky/vague.
+	cases := []struct{ q, reply string }{
+		{"Is there a specific type of drink you would like us to offer more often?", "A banana vitamin would be awesome"},
+		{"Do you think we should add more types of pastries to our menu?", "Of course, I think soft-drink pastries would be nice"},
+		{"What's one thing you'd like to see improved at our coffee shop?", "I don't know, maybe better chairs, I'm not sure"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reply, func(t *testing.T) {
+			got, err := c.ClassifyTurn(ctx, tc.q, tc.reply)
+			if err != nil {
+				t.Fatalf("classify: %v", err)
+			}
+			t.Logf("q=%q reply=%q -> %+v", tc.q, tc.reply, got)
+			if got.Intent == IntentOffTopic || got.Intent == IntentUnintellig {
+				t.Errorf("quirky on-topic reply misclassified as %q (want answer)", got.Intent)
+			}
+		})
+	}
+}

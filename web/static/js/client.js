@@ -203,7 +203,10 @@ function onPlaybackDone() {
 // ---- UI helpers ----
 function setState(cls, text) { orb.className = "orb " + cls; statusEl.textContent = text || ""; }
 function speakStatus(kind) {
-  return kind === "question" ? "asking…" : kind === "closing" ? "wrapping up…" : "speaking…";
+  return kind === "question" ? "asking…"
+    : kind === "closing" ? "wrapping up…"
+    : kind === "confirm" ? "just checking…"
+    : "speaking…";
 }
 function finish(reason) {
   ended = true;

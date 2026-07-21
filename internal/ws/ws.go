@@ -46,11 +46,12 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true }, // PoC: allow any origin
 }
 
-// Handler wires the shared engines into the websocket route.
+// Handler wires the shared engines into the websocket route. LLM is the turn
+// classifier — any backend (local Ollama or Anthropic) via llm.Classifier.
 type Handler struct {
 	Store  *session.Store
 	Speech *speech.Engine
-	LLM    *llm.Client
+	LLM    llm.Classifier
 }
 
 // outMsg is a server->client control frame.
@@ -114,6 +115,13 @@ type conversation struct {
 	speaking bool // true while we expect the client to be playing audio
 	strikes  int  // consecutive silence nudges
 	reasks   int  // times we've re-read the current question
+
+	// Conversational repair: when an answer is understood-but-unclear (calque /
+	// heavy ESL / ambiguous), the agent confirms ONCE before advancing. Capped
+	// per question and fail-open so it can never loop.
+	confirmed       bool   // already did a repair for the current question
+	awaitingConfirm bool   // last agent turn was a repair; next reply resolves it
+	tentative       string // the unclear answer we're confirming
 }
 
 func (cv *conversation) run() {
@@ -218,10 +226,33 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 	turn, err := cv.h.LLM.ClassifyTurn(ctx, q.Text, text)
 	if err != nil {
 		log.Printf("classify error: %v", err)
-		turn = llm.Turn{Intent: llm.IntentAnswer, Sufficient: true} // keep moving
+		turn = llm.Turn{Intent: llm.IntentAnswer, Sufficient: true, Clarity: llm.ClarityClear} // keep moving
 	}
 
-	// Early bail-out (Phase 4): respondent wants to stop.
+	// Resolving a repair: the previous agent turn asked "did I get that right?".
+	// This reply is the confirmation/correction. Fail-open: capture and advance,
+	// never repair the same question twice.
+	if cv.awaitingConfirm {
+		cv.awaitingConfirm = false
+		if turn.Intent == llm.IntentWantsStop { // they can still bail mid-repair
+			cv.sv.Bail()
+			cv.persist()
+			cv.speak("No problem at all — thanks so much for the time you gave us. Take care!", "closing")
+			cv.finalize(survey.Bailed)
+			return true
+		}
+		// A bare "yes/right/exactly" keeps the original answer; anything more is
+		// treated as the corrected answer.
+		ans := cv.tentative
+		if !isAffirmation(text) {
+			ans = text
+		}
+		cv.sv.RecordAnswer(ans)
+		cv.persist()
+		return cv.askNextOrFinish()
+	}
+
+	// Early bail-out (Phase 4): respondent wants to stop the WHOLE survey.
 	if turn.Intent == llm.IntentWantsStop {
 		cv.sv.Bail()
 		cv.persist()
@@ -246,8 +277,18 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		return cv.askNextOrFinish()
 	}
 
-	// A sufficient, on-topic answer: capture and advance.
+	// A sufficient, on-topic answer.
 	if turn.Intent == llm.IntentAnswer && turn.Sufficient {
+		// Understood-but-unclear (calque / heavy ESL / ambiguous): confirm ONCE,
+		// echoing their own words, before advancing. Natural "repair", not a
+		// verbatim re-ask. Capped per question via cv.confirmed.
+		if turn.Clarity == llm.ClarityUnclear && !cv.confirmed {
+			cv.confirmed = true
+			cv.tentative = text
+			cv.awaitingConfirm = true
+			cv.speak(repairPrompt(text), "confirm")
+			return false
+		}
 		cv.sv.RecordAnswer(text)
 		cv.persist()
 		return cv.askNextOrFinish()
@@ -274,7 +315,9 @@ func (cv *conversation) askNextOrFinish() bool {
 	if !ok {
 		return cv.finishCompleted()
 	}
-	cv.reasks = 0 // new question — reset the re-ask counter
+	cv.reasks = 0        // new question — reset the re-ask counter
+	cv.confirmed = false // ...and the one-repair-per-question budget
+	cv.awaitingConfirm = false
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
 	cv.speakQ(q.Text, idx, total)
@@ -413,6 +456,51 @@ func (cv *conversation) readLoop(events chan<- event) {
 			// no-op: we already greeted on connect
 		}
 	}
+}
+
+// repairPrompt confirms an understood-but-unclear answer by echoing the
+// respondent's own transcribed words — natural conversational repair. We echo
+// their words (not a decoded guess) so it works on any model and invites a
+// correction if we misheard.
+func repairPrompt(heard string) string {
+	heard = strings.TrimSpace(heard)
+	return "Sorry, I want to make sure I got that right — you said “" + heard +
+		"”. Did I understand you correctly, or could you say it another way?"
+}
+
+// isAffirmation reports whether a repair reply confirms the original answer (so
+// we keep it) rather than correcting it (so we record the new text). The
+// discriminator is the FIRST word: a yes-token affirms (even if elaborated,
+// "yeah, that's what I meant"); a negation or a fresh restatement corrects.
+func isAffirmation(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Trim(s, ".!,? ")
+	if s == "" {
+		return false
+	}
+	// Multi-word confirmations that don't start with a yes-token.
+	switch s {
+	case "that's right", "thats right", "that's it", "thats it",
+		"uh huh", "uhhuh", "mhm", "mm hmm", "mmhmm":
+		return true
+	}
+	switch firstWord(s) {
+	case "no", "nope", "nah", "not", "actually", "wait", "instead":
+		return false // explicit correction
+	case "yes", "yeah", "yep", "yup", "right", "correct", "exactly", "sure", "ok", "okay":
+		return true // affirmation, possibly elaborated
+	}
+	return false // a restatement with no yes-token → treat as a correction
+}
+
+// firstWord returns the leading run of letters/digits (lowercased input).
+func firstWord(s string) string {
+	for i, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 func followUpPrompt(intent llm.Intent, question string) string {

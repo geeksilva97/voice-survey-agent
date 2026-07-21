@@ -25,6 +25,8 @@ func main() {
 	dataDir := flag.String("data", "data", "directory for poll results")
 	webDir := flag.String("web", "web", "directory with static frontend files")
 	ollamaModel := flag.String("model", "qwen2.5:3b", "Ollama model for question generation")
+	classifyModel := flag.String("classify-model", "", "model for per-turn classification; Ollama or an Anthropic model like claude-sonnet-5 (default: -model). The repair turn fires more on stronger models.")
+	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify models)")
 	flag.Parse()
 
 	log.Println("loading speech models (Kokoro TTS + Whisper STT)…")
@@ -34,10 +36,28 @@ func main() {
 	}
 	defer eng.Close()
 
+	// Question generation always uses the local Ollama model.
 	llmClient, err := llm.New(*ollamaModel)
 	if err != nil {
 		log.Fatalf("llm: %v", err)
 	}
+
+	// The turn classifier is routable: Ollama (incl. :cloud) or Anthropic.
+	cm := *classifyModel
+	if cm == "" {
+		cm = *ollamaModel
+	}
+	var anthropicKey string
+	if llm.IsAnthropicModel(cm) {
+		if anthropicKey, err = llm.LoadAnthropicKey(*anthropicEnv); err != nil {
+			log.Fatalf("classify model %q: %v", cm, err)
+		}
+	}
+	classifier, err := llm.NewClassifier(cm, anthropicKey)
+	if err != nil {
+		log.Fatalf("classifier: %v", err)
+	}
+	log.Printf("question-gen model: %s | classify model: %s", *ollamaModel, cm)
 
 	store, err := session.NewStore(*dataDir)
 	if err != nil {
@@ -45,7 +65,7 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: llmClient}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))

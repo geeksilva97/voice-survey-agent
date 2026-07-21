@@ -35,8 +35,8 @@ if go build ./... 2>&1; then pass "go build ./..."; else fail "go build"; fi
 echo "== 2. vet =="
 if go vet ./... 2>&1; then pass "go vet ./..."; else fail "go vet"; fi
 
-echo "== 3. unit tests (state machine) =="
-if go test ./internal/survey/ 2>&1; then pass "survey state machine"; else fail "survey tests"; fi
+echo "== 3. unit tests (state machine + repair helpers) =="
+if go test ./internal/survey/ ./internal/ws/ 2>&1; then pass "survey state machine + ws repair helpers"; else fail "unit tests"; fi
 
 # Ollama-dependent steps
 OLLAMA_UP=0
@@ -44,16 +44,27 @@ if curl -s -o /dev/null http://localhost:11434/api/tags; then OLLAMA_UP=1; fi
 
 echo "== 4. LLM turn classifier (bail-out detection) =="
 if [ "$OLLAMA_UP" = 1 ]; then
-  if go test ./internal/llm/ -run TestClassifyTurn 2>&1; then pass "LLM classify (answer vs wants_stop)"; else fail "LLM classify"; fi
+  if go test ./internal/llm/ -run 'TestClassifyTurn|TestClassifyQuirkyAnswer' 2>&1; then pass "LLM classify (answer vs wants_stop, quirky answers)"; else fail "LLM classify"; fi
 else
   skip "ollama not on :11434 — start it and re-run"
+fi
+
+echo "== 5. intent-classification eval (labeled corpus vs live LLM) =="
+# Gate runs the LOCAL model only (fast/offline). For the full cross-model
+# comparison matrix run: go run ./cmd/eval   (defaults to all models).
+if [ "$OLLAMA_UP" = 1 ]; then
+  EVAL_OUT=$(go run ./cmd/eval -models "$MODEL" 2>&1)
+  echo "$EVAL_OUT" | grep -E 'EVAL (PASSED|FAILED)'
+  if echo "$EVAL_OUT" | grep -q 'EVAL PASSED'; then pass "intent eval (acc>=90%, answer>=95%)"; else fail "intent eval"; echo "$EVAL_OUT" | tail -25; fi
+else
+  skip "ollama not on :11434 — eval needs it"
 fi
 
 # Models present?
 MODELS_OK=1
 [ -d models/kokoro-en-v0_19 ] && [ -d models/sherpa-onnx-whisper-base.en ] || MODELS_OK=0
 
-echo "== 5. headless conversation (happy + silence) =="
+echo "== 6. headless conversation (happy + silence) =="
 if [ "$OLLAMA_UP" = 1 ] && [ "$MODELS_OK" = 1 ]; then
   go build -o bin/server ./cmd/server || fail "server build"
   ./bin/server -addr ":$PORT" >/tmp/vs-validate.log 2>&1 &
