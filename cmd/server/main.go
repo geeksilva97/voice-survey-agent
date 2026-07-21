@@ -54,7 +54,8 @@ func main() {
 	mux.HandleFunc("GET /poll/{id}", app.page("poll.html"))
 	mux.HandleFunc("GET /results/{id}", app.page("results.html"))
 	mux.HandleFunc("GET /ws", wsHandler.Serve)
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir(filepath.Join(*webDir, "static")))))
+	staticFS := http.FileServer(http.Dir(filepath.Join(*webDir, "static")))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", noCache(staticFS)))
 
 	log.Printf("voice-survey PoC listening on http://localhost%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
@@ -69,8 +70,18 @@ type app struct {
 // page serves a static HTML file from the web dir.
 func (a *app) page(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, filepath.Join(a.webDir, name))
 	}
+}
+
+// noCache prevents the browser from serving stale JS/CSS — important while
+// iterating, so a reload always picks up the latest client.js.
+func noCache(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (a *app) createPoll(w http.ResponseWriter, r *http.Request) {

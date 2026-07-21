@@ -2,110 +2,147 @@
 //
 // Pipeline: Silero VAD (in-browser, WASM) detects when the respondent finishes
 // speaking -> we send that utterance (PCM16 16kHz) over a single WebSocket ->
-// the Go server transcribes, decides the next line, and streams back WAV audio
-// we play. Half-duplex by default (VAD paused while the agent talks); optional
-// barge-in keeps the mic hot so the user can interrupt.
+// the Go server transcribes, decides the next line, and STREAMS back TTS audio
+// as sentence chunks that we play through a queue (so the first words start fast).
+// Half-duplex by default (VAD paused while the agent talks); optional barge-in
+// keeps the mic hot so the user can interrupt.
 
 const pollId = location.pathname.split("/").pop();
 
 const el = (id) => document.getElementById(id);
 const orb = el("orb"), caption = el("caption"), statusEl = el("status"),
-      heard = el("heard"), progress = el("progress"), barfill = el("barfill");
+      heard = el("heard"), progress = el("progress"), barfill = el("barfill"),
+      transcriptEl = el("transcript");
 
-let ws, vad, audioCtx;
-let currentSource = null;   // active AudioBufferSourceNode (for barge-in stop)
+// Append a line to the running conversation transcript (visible live + at end).
+function appendLine(role, text) {
+  if (!text) return;
+  const row = document.createElement("div");
+  row.className = "t-row t-" + role;
+  const who = document.createElement("span");
+  who.className = "t-who";
+  who.textContent = role === "you" ? "You" : "Agent";
+  row.appendChild(who);
+  row.appendChild(document.createTextNode(text));
+  transcriptEl.appendChild(row);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+let ws, vad, audioCtx, vadReady;
 let bargeIn = false;
 let ended = false;
 
+// Playback queue (streamed sentence chunks for the current agent turn).
+let audioQueue = [];
+let playing = false;
+let ttsEnded = false;          // server sent tts_end for this turn
+let playbackDoneSent = false;  // guard: fire onPlaybackDone once per turn
+let currentSource = null;      // active AudioBufferSourceNode (for barge-in stop)
+
+// "User is speaking" keep-alive: while true we ping the server so its silence
+// timer keeps resetting during a long, pause-filled answer.
+let userSpeaking = false;
+
 el("start").onclick = start;
+// Restart re-takes the same poll on the same link (server starts a fresh run
+// on every new connection, so a reload is a clean restart).
+const restartBtn = el("restart");
+if (restartBtn) restartBtn.onclick = () => location.reload();
 
 async function start() {
   bargeIn = el("bargein").checked;
   el("pre").classList.add("hidden");
   el("live").classList.remove("hidden");
+  transcriptEl.classList.remove("hidden");
   setState("thinking", "connecting…");
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  await audioCtx.resume(); // unlock playback (we're inside a user gesture)
+  await audioCtx.resume(); // unlock playback (inside the user gesture)
 
-  try {
-    await setupVAD();
-  } catch (e) {
+  // Load VAD in the BACKGROUND so it doesn't delay the agent's first words.
+  vadReady = setupVAD().catch((e) => {
     setState("thinking", "microphone unavailable: " + e.message);
-    return;
-  }
-  connect();
+    throw e;
+  });
+  connect(); // server starts streaming the greeting immediately
+
+  // Keep-alive ping so long answers never trip the server silence timer.
+  setInterval(() => { if (userSpeaking && !ended) sendJSON({ type: "speaking" }); }, 2500);
 }
 
 // ---- VAD ----
 async function setupVAD() {
-  if (!window.vad || !window.vad.MicVAD) {
-    throw new Error("VAD library failed to load (offline?)");
-  }
+  if (!window.vad || !window.vad.MicVAD) throw new Error("VAD library failed to load (offline?)");
   vad = await window.vad.MicVAD.new({
-    // vad-web 0.0.22 defaults to the Silero v5 model (~32ms/frame). The primary
-    // end-of-turn knob is redemptionFrames = trailing silence tolerated before
-    // we call the turn over. ~20 frames ≈ 640ms, which feels natural for survey
-    // answers (raise it if the agent cuts people off; lower for snappier turns).
-    redemptionFrames: 20,
+    // Silero v5 (~32ms/frame). redemptionFrames = trailing silence tolerated
+    // before the turn is called over; ~28 ≈ 900ms tolerates mid-answer pauses.
+    redemptionFrames: 28,
     minSpeechFrames: 3,
     preSpeechPadFrames: 10,
     positiveSpeechThreshold: 0.6,
     negativeSpeechThreshold: 0.35,
     onSpeechStart: () => {
-      // Barge-in: user talks while the agent is playing -> interrupt.
-      if (bargeIn && currentSource) {
-        stopPlayback();
-        sendJSON({ type: "barge_in" });
-      }
-      if (isListening()) setState("listening", "listening…");
+      console.log("[vad] speech start");
+      userSpeaking = true;
+      sendJSON({ type: "speaking" }); // reset the server silence timer now
+      if (bargeIn && currentSource) { stopPlayback(); sendJSON({ type: "barge_in" }); }
+      if (isListening()) setState("listening", "🎤 I can hear you — keep going…");
     },
     onSpeechEnd: (audio) => {
       if (ended) return;
-      // audio: Float32Array @16kHz. Ship it as PCM16 and wait for the reply.
-      sendPCM(audio);
-      setState("thinking", "…");
+      console.log("[vad] speech end,", audio.length, "samples");
+      userSpeaking = false;
+      sendPCM(audio); // Float32Array @16kHz -> PCM16
+      setState("thinking", "got it — thinking…");
     },
-    onVADMisfire: () => {},
+    onVADMisfire: () => { userSpeaking = false; },
   });
   vad.pause(); // stays paused until it's the respondent's turn
 }
 
-function listenTurn() {
+async function listenTurn() {
   if (ended) return;
-  vad && vad.start();
+  try { await vadReady; } catch { return; } // VAD may still be loading on the first turn
+  if (ended) return;
+  if (vad) vad.start();
   setState("listening", "your turn — speak whenever you're ready");
 }
 
-function isListening() {
-  return orb.classList.contains("listening");
-}
+function isListening() { return orb.classList.contains("listening"); }
 
 // ---- WebSocket ----
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws?poll=${pollId}`);
   ws.binaryType = "arraybuffer";
-
   ws.onopen = () => sendJSON({ type: "ready" });
   ws.onclose = () => { if (!ended) setState("thinking", "connection closed"); };
   ws.onerror = () => setState("thinking", "connection error");
 
   ws.onmessage = (ev) => {
-    if (ev.data instanceof ArrayBuffer) { playWav(ev.data); return; }
+    if (ev.data instanceof ArrayBuffer) { audioQueue.push(ev.data); playNext(); return; }
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     switch (m.type) {
       case "agent_say":
+        // New agent turn: reset the playback queue/flags.
+        audioQueue = []; ttsEnded = false; playbackDoneSent = false;
+        if (!bargeIn && vad) vad.pause();
         caption.textContent = m.text;
         if (m.total) { progress.textContent = `${m.index} / ${m.total}`; barfill.style.width = (100 * m.index / m.total) + "%"; }
         heard.textContent = "";
+        appendLine("agent", m.text);
         setState("speaking", speakStatus(m.kind));
+        break;
+      case "tts_end":
+        ttsEnded = true;
+        if (!playing && audioQueue.length === 0) onPlaybackDone();
         break;
       case "transcript":
         heard.textContent = m.text ? `“${m.text}”` : "(didn't catch that)";
+        appendLine("you", m.text);
         break;
       case "cancel":
-        stopPlayback();
+        stopPlayback(); audioQueue = [];
         break;
       case "done":
         finish(m.reason);
@@ -125,45 +162,41 @@ function sendPCM(float32) {
   if (ws && ws.readyState === 1) ws.send(pcm.buffer);
 }
 
-// ---- Playback ----
-async function playWav(buf) {
-  try {
-    // Keep the mic hot only in barge-in mode; otherwise half-duplex.
-    if (!bargeIn && vad) vad.pause();
-    const audioBuf = await audioCtx.decodeAudioData(buf.slice(0));
-    stopPlayback();
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(audioCtx.destination);
-    src.onended = () => {
-      if (currentSource === src) currentSource = null;
-      onPlaybackDone();
-    };
-    currentSource = src;
-    src.start();
-  } catch (e) {
-    onPlaybackDone(); // don't stall the turn loop on a decode error
-  }
+// ---- Streamed playback ----
+async function playNext() {
+  if (playing) return;
+  const buf = audioQueue.shift();
+  if (!buf) { if (ttsEnded) onPlaybackDone(); return; }
+  playing = true;
+  let audioBuf;
+  try { audioBuf = await audioCtx.decodeAudioData(buf.slice(0)); }
+  catch { playing = false; return playNext(); }
+  const src = audioCtx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(audioCtx.destination);
+  src.onended = () => {
+    if (currentSource === src) currentSource = null;
+    playing = false;
+    playNext();
+  };
+  currentSource = src;
+  src.start();
 }
 
 function stopPlayback() {
-  if (currentSource) {
-    try { currentSource.onended = null; currentSource.stop(); } catch {}
-    currentSource = null;
-  }
+  if (currentSource) { try { currentSource.onended = null; currentSource.stop(); } catch {} currentSource = null; }
+  playing = false;
 }
 
 function onPlaybackDone() {
-  if (ended) return;
+  if (ended || playbackDoneSent) return;
+  playbackDoneSent = true;
   sendJSON({ type: "playback_done" });
   listenTurn();
 }
 
 // ---- UI helpers ----
-function setState(cls, text) {
-  orb.className = "orb " + cls;
-  statusEl.textContent = text || "";
-}
+function setState(cls, text) { orb.className = "orb " + cls; statusEl.textContent = text || ""; }
 function speakStatus(kind) {
   return kind === "question" ? "asking…" : kind === "closing" ? "wrapping up…" : "speaking…";
 }

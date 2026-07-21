@@ -63,7 +63,9 @@ func (c *Client) GenerateQuestions(ctx context.Context, product string) ([]strin
 	sys := "You write short opinion-poll questions for a VOICE survey. " +
 		"The questions will be read aloud and answered by speaking, so keep each " +
 		"one to a single, natural, conversational sentence. No numbering, no preamble. " +
-		"Ask about the respondent's honest opinion, experience, and suggestions."
+		"Ask about the respondent's honest opinion, experience, and suggestions. " +
+		"NEVER use placeholders or brackets like [Name] or [Restaurant Name]; if a " +
+		"specific detail is unknown, phrase the question generally (e.g. 'our candles')."
 	user := fmt.Sprintf("Product / topic: %s\n\n"+
 		"Write 3 to 5 poll questions. Respond ONLY as JSON: "+
 		`{"questions": ["...", "..."]}`, strings.TrimSpace(product))

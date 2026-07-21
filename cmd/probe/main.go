@@ -59,24 +59,7 @@ func main() {
 			return
 		}
 		if mt == websocket.BinaryMessage {
-			// Agent finished a spoken clip. Ack playback.
-			_ = c.WriteJSON(map[string]string{"type": "playback_done"})
-			if lastKind == "closing" {
-				continue // no reply expected; a "done" will arrive
-			}
-			turns++
-			if turns > *maxTurns {
-				log.Fatalf("exceeded max turns (%d) without ending", *maxTurns)
-			}
-			if *mode == "silent" {
-				fmt.Println("  · (staying silent)")
-				continue // exercise the silence backstop
-			}
-			// Small pause to mimic the respondent, then answer.
-			time.Sleep(250 * time.Millisecond)
-			fmt.Println("  → sending canned answer")
-			_ = c.WriteMessage(websocket.BinaryMessage, utterance)
-			continue
+			continue // a turn streams several audio chunks; wait for tts_end
 		}
 
 		var m struct {
@@ -94,6 +77,26 @@ func main() {
 				pos = fmt.Sprintf(" [%d/%d]", m.Index, m.Total)
 			}
 			fmt.Printf("AGENT(%s)%s: %s\n", m.Kind, pos, m.Text)
+		case "tts_end":
+			// The agent finished this turn's audio. Ack playback.
+			_ = c.WriteJSON(map[string]string{"type": "playback_done"})
+			if lastKind == "closing" {
+				continue // no reply expected; a "done" will arrive
+			}
+			turns++
+			if turns > *maxTurns {
+				log.Fatalf("exceeded max turns (%d) without ending", *maxTurns)
+			}
+			if *mode == "silent" {
+				fmt.Println("  · (staying silent)")
+				continue // exercise the silence backstop
+			}
+			// Mirror the browser client: signal "speaking" (resets the silence
+			// timer) before delivering the utterance.
+			time.Sleep(250 * time.Millisecond)
+			_ = c.WriteJSON(map[string]string{"type": "speaking"})
+			fmt.Println("  → sending canned answer")
+			_ = c.WriteMessage(websocket.BinaryMessage, utterance)
 		case "transcript":
 			fmt.Printf("  heard: %q\n", m.Text)
 		case "done":

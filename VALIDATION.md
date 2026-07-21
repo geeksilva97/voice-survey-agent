@@ -52,6 +52,11 @@ endpointing, TTS playback, and the turn loop. It works by overriding
 and auto-answering whenever the agent starts listening. **Ground truth is the
 server's `data/<id>.json` `end_reason`.**
 
+> ⚠️ **Always QA with the `scented candles` product.** The fake-mic answer clips
+> (`ans0/1/2.wav`) are candle-themed ("the scent is relaxing…"), so a
+> restaurant/coffee poll would get mismatched answers. Create the QA poll with
+> product `hand-poured scented soy candles for the home`.
+
 Harness files (committed, reusable):
 - `scripts/browser-e2e/fakemic.js` — inject as an **init script** (before page load)
 - `scripts/browser-e2e/autoanswer.js` — inject **after clicking Start**

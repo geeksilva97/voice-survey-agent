@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -35,9 +36,9 @@ import (
 
 // Tuning knobs for turn-taking timeouts.
 const (
-	inputSampleRate = 16000           // browser captures/sends 16kHz mono
-	silenceWindow   = 9 * time.Second // how long to wait for a reply before nudging
-	maxSilenceStrikes = 2             // nudges before ending on silence
+	inputSampleRate   = 16000            // browser captures/sends 16kHz mono
+	silenceWindow     = 12 * time.Second // how long to wait for a reply before nudging
+	maxSilenceStrikes = 2                // nudges before ending on silence
 )
 
 var upgrader = websocket.Upgrader{
@@ -68,6 +69,7 @@ const (
 	evUtterance eventKind = iota
 	evPlaybackDone
 	evBargeIn
+	evUserSpeaking
 	evClosed
 )
 
@@ -84,6 +86,13 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown poll", http.StatusNotFound)
 		return
 	}
+	// Restart-on-connect: each new session starts a FRESH run of the same poll,
+	// so the same /poll/<id> link can be re-taken (reload the page to restart).
+	poll.Survey = survey.New(poll.Questions)
+	poll.EndReason = survey.NotEnded
+	poll.EndedAt = nil
+	h.Store.Save(poll)
+
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -116,9 +125,23 @@ func (cv *conversation) run() {
 	timer.Stop() // only armed while listening
 	defer timer.Stop()
 
+	// stopSilence/resetSilence drain timer.C so a value that fired while we were
+	// busy in handleUtterance can't trigger a spurious reprompt after we reset.
+	stopSilence := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+	resetSilence := func() {
+		stopSilence()
+		timer.Reset(silenceWindow)
+	}
 	arm := func() {
 		if !cv.speaking {
-			timer.Reset(silenceWindow)
+			resetSilence()
 		}
 	}
 
@@ -135,17 +158,26 @@ func (cv *conversation) run() {
 			case evPlaybackDone:
 				// Agent finished talking; begin listening + silence countdown.
 				cv.speaking = false
-				timer.Reset(silenceWindow)
+				resetSilence()
 
 			case evBargeIn:
 				// User talked over the agent: tell client to stop playback,
 				// then listen. (Phase 5; harmless if it fires otherwise.)
 				cv.send(outMsg{Type: "cancel"})
 				cv.speaking = false
-				timer.Reset(silenceWindow)
+				resetSilence()
+
+			case evUserSpeaking:
+				// The respondent is actively talking. Restart the silence clock
+				// so a long, pause-filled answer doesn't trip the "still there?"
+				// nudge before they finish and VAD emits the utterance.
+				cv.strikes = 0
+				if !cv.speaking {
+					resetSilence()
+				}
 
 			case evUtterance:
-				timer.Stop()
+				stopSilence()
 				cv.strikes = 0
 				if done := cv.handleUtterance(ev.pcm); done {
 					return
@@ -157,6 +189,7 @@ func (cv *conversation) run() {
 			if cv.speaking {
 				continue
 			}
+			log.Printf("[ws] silence timer fired (strike %d, speaking=%v)", cv.strikes+1, cv.speaking)
 			cv.strikes++
 			if cv.strikes >= maxSilenceStrikes {
 				cv.endSurveyBySilence()
@@ -172,6 +205,7 @@ func (cv *conversation) run() {
 // speaks the next thing. Returns true when the conversation has ended.
 func (cv *conversation) handleUtterance(pcm []byte) bool {
 	text := cv.h.Speech.Transcribe(pcm, inputSampleRate)
+	log.Printf("[ws] handleUtterance: transcript=%q", text)
 	cv.send(outMsg{Type: "transcript", Text: text})
 
 	q, ok := cv.sv.Current()
@@ -254,9 +288,10 @@ func (cv *conversation) greetAndAskFirst() {
 	// the first question as two separate clips (the second would cut off the first).
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	intro := "Hi! Thanks for taking a moment. I've got a few quick questions about " +
-		cv.poll.Product + ". There are no wrong answers — just share whatever comes to mind. " +
-		"Here's my first question: " + q.Text
+	// Keep the opening short so the first audio arrives fast and there's less
+	// temptation to answer over it. TTS is streamed sentence-by-sentence.
+	intro := "Hi! A few quick questions about " + cv.poll.Product +
+		". There are no wrong answers. Here's the first: " + q.Text
 	cv.emit(outMsg{Type: "agent_say", Text: intro, Kind: "question", Index: idx, Total: total}, intro)
 }
 
@@ -270,20 +305,49 @@ func (cv *conversation) speak(text, kind string) {
 	cv.emit(outMsg{Type: "agent_say", Text: text, Kind: kind}, text)
 }
 
-// emit sends the control frame, synthesizes the audio, and sends it as a binary
-// frame. Sets speaking=true so the silence timer stays paused until playback_done.
+// emit sends the control frame, then STREAMS the audio sentence-by-sentence:
+// each sentence is synthesized and sent as its own binary frame so the client
+// can start playing the first words while later sentences are still rendering.
+// A trailing tts_end tells the client the turn's audio is complete.
+// Sets speaking=true so the silence timer stays paused until playback_done.
 func (cv *conversation) emit(msg outMsg, ttsText string) {
 	cv.speaking = true
 	cv.send(msg)
-	wav, err := cv.h.Speech.Synthesize(ttsText)
-	if err != nil {
-		log.Printf("tts error: %v", err)
-		cv.speaking = false
-		return
+	for _, chunk := range splitSentences(ttsText) {
+		wav, err := cv.h.Speech.Synthesize(chunk)
+		if err != nil {
+			log.Printf("tts error: %v", err)
+			continue
+		}
+		if err := cv.c.WriteMessage(websocket.BinaryMessage, wav); err != nil {
+			cv.speaking = false
+			return
+		}
 	}
-	if err := cv.c.WriteMessage(websocket.BinaryMessage, wav); err != nil {
-		cv.speaking = false
+	cv.send(outMsg{Type: "tts_end"})
+}
+
+// splitSentences breaks text at sentence terminators so TTS can stream. The
+// first (often short) chunk renders fast, cutting time-to-first-audio.
+func splitSentences(text string) []string {
+	var out []string
+	var b strings.Builder
+	for _, r := range text {
+		b.WriteRune(r)
+		if r == '.' || r == '!' || r == '?' {
+			if s := strings.TrimSpace(b.String()); s != "" {
+				out = append(out, s)
+			}
+			b.Reset()
+		}
 	}
+	if s := strings.TrimSpace(b.String()); s != "" {
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return []string{text}
+	}
+	return out
 }
 
 func (cv *conversation) send(msg outMsg) {
@@ -326,6 +390,8 @@ func (cv *conversation) readLoop(events chan<- event) {
 			events <- event{kind: evPlaybackDone}
 		case "barge_in":
 			events <- event{kind: evBargeIn}
+		case "speaking":
+			events <- event{kind: evUserSpeaking}
 		case "ready":
 			// no-op: we already greeted on connect
 		}
