@@ -38,6 +38,7 @@ let playing = false;
 let ttsEnded = false;          // server sent tts_end for this turn
 let playbackDoneSent = false;  // guard: fire onPlaybackDone once per turn
 let currentSource = null;      // active AudioBufferSourceNode (for barge-in stop)
+let pendingEnd = null;         // end reason received while closing audio still plays
 
 // "User is speaking" keep-alive: while true we ping the server so its silence
 // timer keeps resetting during a long, pause-filled answer.
@@ -116,7 +117,7 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/ws?poll=${pollId}`);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => sendJSON({ type: "ready" });
-  ws.onclose = () => { if (!ended) setState("thinking", "connection closed"); };
+  ws.onclose = () => { if (!ended && !pendingEnd) setState("thinking", "connection closed"); };
   ws.onerror = () => setState("thinking", "connection error");
 
   ws.onmessage = (ev) => {
@@ -125,7 +126,7 @@ function connect() {
     switch (m.type) {
       case "agent_say":
         // New agent turn: reset the playback queue/flags.
-        audioQueue = []; ttsEnded = false; playbackDoneSent = false;
+        audioQueue = []; ttsEnded = false; playbackDoneSent = false; pendingEnd = null;
         if (!bargeIn && vad) vad.pause();
         caption.textContent = m.text;
         if (m.total) { progress.textContent = `${m.index} / ${m.total}`; barfill.style.width = (100 * m.index / m.total) + "%"; }
@@ -145,7 +146,10 @@ function connect() {
         stopPlayback(); audioQueue = [];
         break;
       case "done":
-        finish(m.reason);
+        // Don't cut off the closing message: if audio is still playing/queued,
+        // remember the reason and end once playback drains (see onPlaybackDone).
+        pendingEnd = m.reason;
+        if (!playing && audioQueue.length === 0) finish(pendingEnd);
         break;
     }
   };
@@ -191,6 +195,7 @@ function stopPlayback() {
 function onPlaybackDone() {
   if (ended || playbackDoneSent) return;
   playbackDoneSent = true;
+  if (pendingEnd) { finish(pendingEnd); return; } // closing audio finished → end now
   sendJSON({ type: "playback_done" });
   listenTurn();
 }
