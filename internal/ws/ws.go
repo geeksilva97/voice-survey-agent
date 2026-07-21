@@ -189,7 +189,6 @@ func (cv *conversation) run() {
 			if cv.speaking {
 				continue
 			}
-			log.Printf("[ws] silence timer fired (strike %d, speaking=%v)", cv.strikes+1, cv.speaking)
 			cv.strikes++
 			if cv.strikes >= maxSilenceStrikes {
 				cv.endSurveyBySilence()
@@ -205,7 +204,6 @@ func (cv *conversation) run() {
 // speaks the next thing. Returns true when the conversation has ended.
 func (cv *conversation) handleUtterance(pcm []byte) bool {
 	text := cv.h.Speech.Transcribe(pcm, inputSampleRate)
-	log.Printf("[ws] handleUtterance: transcript=%q", text)
 	cv.send(outMsg{Type: "transcript", Text: text})
 
 	q, ok := cv.sv.Current()
