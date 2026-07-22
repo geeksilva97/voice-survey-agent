@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/survey"
 )
 
 // TestIsAffirmation locks down the yes/no rule that decides, after a repair
@@ -76,5 +77,52 @@ func TestFollowUpPrompt(t *testing.T) {
 	// A vague on-topic answer gets a gentle probe, not a re-read.
 	if got := followUpPrompt(llm.IntentAnswer, "", q); strings.Contains(got, q) {
 		t.Errorf("vague-answer probe should not re-read the question; got %q", got)
+	}
+}
+
+// TestIntroLine: the LLM-authored opening wins when present; otherwise a fixed,
+// product-named greeting is used so the first turn always sounds complete.
+func TestIntroLine(t *testing.T) {
+	if got := introLine("  Hey there, just a few quick questions! Let's start:  ", "candles"); got != "Hey there, just a few quick questions! Let's start:" {
+		t.Errorf("introLine should return the trimmed LLM intro; got %q", got)
+	}
+	fb := introLine("   ", "hand-poured soy candles")
+	if !strings.Contains(fb, "hand-poured soy candles") || !strings.HasSuffix(fb, "first:") {
+		t.Errorf("blank intro should fall back to a fixed product greeting ending in a hand-off; got %q", fb)
+	}
+}
+
+// TestSanitizeClosing: a good one-liner is kept (quotes stripped, newlines
+// collapsed); empty or oversized output is rejected so the fixed close is used.
+func TestSanitizeClosing(t *testing.T) {
+	if got := sanitizeClosing("  \"Loved that the lavender one is your\nevening ritual — take care!\"  "); got != "Loved that the lavender one is your evening ritual — take care!" {
+		t.Errorf("sanitizeClosing should strip quotes and collapse newlines; got %q", got)
+	}
+	if got := sanitizeClosing("   "); got != "" {
+		t.Errorf("empty closing should be rejected; got %q", got)
+	}
+	if got := sanitizeClosing(strings.Repeat("blah ", 100)); got != "" {
+		t.Errorf("oversized closing should be rejected so the fixed line is used; got %q", got)
+	}
+}
+
+// TestCloseTranscript: only actually-answered slots feed the personalized close,
+// so it can never reference a skipped or unanswered question.
+func TestCloseTranscript(t *testing.T) {
+	sv := survey.New([]string{"Q1?", "Q2?", "Q3?"})
+	sv.RecordAnswer("I love the lavender one")
+	sv.RecordAnswer("about three times a week")
+	sv.CaptureAndAdvance("") // Q3 skipped → must not appear
+
+	got := closeTranscript(sv)
+	if !strings.Contains(got, "Q1?") || !strings.Contains(got, "I love the lavender one") {
+		t.Errorf("transcript should include answered slots; got %q", got)
+	}
+	if strings.Contains(got, "Q3?") {
+		t.Errorf("transcript must omit skipped slots; got %q", got)
+	}
+
+	if got := closeTranscript(survey.New([]string{"Q1?"})); got != "" {
+		t.Errorf("no answers → empty transcript (forces fixed close); got %q", got)
 	}
 }

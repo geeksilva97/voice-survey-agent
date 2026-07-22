@@ -169,6 +169,52 @@ empty ack (so the layer stays inert — the plain question is asked, exactly the
 pre-ack behavior), while cloud/hosted models produce rich, specific acks. The
 eval's `ack` column (LLM-judge, ungated) quantifies this.
 
+### Opening & closing lines (product-aware intro, personalized sign-off)
+
+The greeting and farewell used to be one hardcoded string each. Both are now
+authored by an LLM so every poll opens and closes in its own voice.
+
+- **Intro** — generated once at poll creation, in the SAME call that produces the
+  questions (`llm.GenerateSurvey` → `SurveyPlan{Questions, Intro}`), and stored on
+  the poll (`Poll.Intro`). It's a warm, product-aware opening spoken before the
+  first question. Deterministic at runtime (zero added latency, no per-turn risk).
+  Missing/oversized intro (`cleanIntro`) → falls back to the fixed greeting via
+  `introLine`. Author model is the question-gen model (always local `qwen2.5:3b`).
+
+- **Closing** — a personalized **callback**: at happy-path completion the agent
+  asks a one-shot `Completer` (the `Closer`, wired from the *classify* model — the
+  conversation's "brain") for a farewell that references ONE genuine thing the
+  respondent actually said. The call runs at end-of-conversation, so latency is a
+  non-issue. Safety rails: only **answered** slots feed the prompt
+  (`closeTranscript`); if nothing was answered, or the model errors, or the reply
+  fails `sanitizeClosing` (empty / multi-line / >240 chars), it falls back to the
+  fixed close — a personalized-close path never invents a reference and never
+  double-acks (it drops the last-turn `lead`). Deterministic helpers are unit
+  tested (`TestIntroLine`, `TestSanitizeClosing`, `TestCloseTranscript`).
+
+Validate live (both fire in the headless happy probe; the fixed-fallback case is
+covered whenever no answer is captured):
+
+```bash
+# Product-aware intro (inspect the stored poll):
+curl -s -XPOST localhost:8090/api/polls -H 'content-type: application/json' \
+  -d '{"product":"hand-poured scented soy candles for the home"}'   # note the id
+python3 -c "import json;print(json.load(open('data/<id>.json'))['intro'])"
+
+# Intro spoken + personalized closing (strong closer). Feed a REAL answer clip so
+# slots actually fill (the default probe clip classifies off-topic → fixed close):
+./bin/server -classify-model claude-sonnet-5 &      # key read in-process, never printed
+go run ./cmd/probe -mode happy -product "hand-poured scented soy candles for the home" -wav <16kHz-answer.wav>
+```
+
+Last live check (2026-07-21, classify/closer = `claude-sonnet-5`): intro
+*"Hello there! Just a few quick questions about our hand-poured scented soy
+candles in your home. How do you like the scent…"*; closing *"It's great to hear
+how relaxing you find the scent and that they last so long—thanks so much for
+your time today, take care!"* — referenced the captured answer, ended
+`completed`. Fixed-fallback confirmed on a qwen run where the probe clip
+classified off-topic (nothing answered → generic close, no fabricated reference).
+
 ### Insights / per-response scoring (`/insights/<id>`)
 
 A separate results page scores a completed conversation with an **independent**
@@ -282,6 +328,28 @@ go run ./cmd/server -classify-model claude-sonnet-5
   - `claude-sonnet-5` (poll `8fc80b827a`) — *"Ha, no worries —"* redirect, then a
     specific ack every turn with varied phrasing (*"…got it."*, *"…love it."*,
     *"…noted."*).
+- **Opening intro + personalized closing — per classify/closer model**
+  (2026-07-21, candles, happy path `['ans0','ans1','ans2']`, all
+  `end_reason=completed`). Intro is authored by the question-gen model (always
+  `qwen2.5:3b`), so it's the same style across runs; the personalized closing is
+  authored by the classify/closer model, so it varies:
+  - `qwen2.5:3b` (poll `3da2b71595`) — intro *"Hello and thanks for taking a
+    moment to share your thoughts on our hand-poured scented soy candles…"*;
+    closing *"I hear you love lavender and vanilla the most, perfect for a
+    relaxing evening. Thanks so much for your feedback!"* — even the 3B produced a
+    real callback (the closing prompt is simpler than the ack).
+  - `glm-5.2:cloud` (poll `cda6fafc19`) — closing *"It's great that warm, calming
+    scents like lavender and vanilla make your living room feel so cozy — thanks
+    so much for sharing your thoughts, and have a wonderful day!"*
+  - `gemma4:31b-cloud` (poll `c1c7c35fab`) — intro included the honesty
+    reassurance; closing *"It's great that you're looking for those warm and
+    calming scents for your living room. Thanks for your time, and have a
+    wonderful day!"*
+  - `claude-sonnet-5` (poll `7de10d8a67`) — closing *"I really love that lavender
+    and vanilla combo you mentioned for a warm, calming living room feel. Thanks
+    so much for sharing your thoughts, and take care!"*
+  - Fixed-fallback confirmed separately (headless probe, qwen, non-candle clip →
+    nothing answered → generic close, no fabricated reference).
 - **Insights page** — `/insights/<completed poll>` scored by `qwen2.5:3b`
   offline: positive sentiment, discriminating per-answer usefulness/confidence
   (off-question repeats correctly dropped to 1–2); cached re-fetch ~2ms; a

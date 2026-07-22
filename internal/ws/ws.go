@@ -48,10 +48,13 @@ var upgrader = websocket.Upgrader{
 
 // Handler wires the shared engines into the websocket route. LLM is the turn
 // classifier — any backend (local Ollama or Anthropic) via llm.Classifier.
+// Closer authors the personalized closing sign-off (optional: nil falls back to
+// a fixed farewell).
 type Handler struct {
 	Store  *session.Store
 	Speech *speech.Engine
 	LLM    llm.Classifier
+	Closer llm.Completer
 }
 
 // outMsg is a server->client control frame.
@@ -336,10 +339,96 @@ func (cv *conversation) askNextOrFinish(lead string) bool {
 	return false
 }
 
+// defaultClose is the fixed, always-safe farewell used when no personalized
+// sign-off is available (no Closer wired, LLM error, or an implausible result).
+const defaultClose = "That's everything I wanted to ask. Thank you so much for sharing your thoughts — it really helps. Goodbye!"
+
 func (cv *conversation) finishCompleted(lead string) bool {
-	cv.speak(withLead(lead, "That's everything I wanted to ask. Thank you so much for sharing your thoughts — it really helps. Goodbye!"), "closing")
+	// Try a warm sign-off that references what the respondent actually said —
+	// the most human moment available, and free of latency worry since the call
+	// is ending. On any failure, fall back to the fixed close (carrying the
+	// last-turn acknowledgment as a lead-in). A personalized close already
+	// acknowledges, so we deliberately drop `lead` in that path to avoid
+	// double-thanking.
+	if closing := cv.personalClose(); closing != "" {
+		cv.speak(closing, "closing")
+	} else {
+		cv.speak(withLead(lead, defaultClose), "closing")
+	}
 	cv.finalize(survey.Completed)
 	return true
+}
+
+// personalClose asks the Closer model for a short farewell that references a
+// genuine highlight from the answers. Returns "" (→ caller uses defaultClose)
+// when there's no Closer, nothing was actually answered, the call errors, or the
+// result fails the sanity check.
+func (cv *conversation) personalClose() string {
+	if cv.h.Closer == nil {
+		return ""
+	}
+	transcript := closeTranscript(cv.sv)
+	if transcript == "" {
+		return "" // nothing captured to reference — a personalized line would be hollow
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	raw, err := cv.h.Closer.Complete(ctx, closingSystem, "Product: "+cv.poll.Product+"\n\nWhat the respondent said:\n"+transcript+"\n\nWrite the closing line.")
+	if err != nil {
+		log.Printf("personalized close degraded, using fixed line: %v", err)
+		return ""
+	}
+	return sanitizeClosing(raw)
+}
+
+const closingSystem = "You are a friendly voice-survey agent wrapping up a short spoken survey. " +
+	"Write ONE warm closing line to SAY OUT LOUD. Requirements: reference ONE " +
+	"specific, genuine thing the respondent actually said (their idea, not their " +
+	"exact words); then thank them and say goodbye. 1-2 short sentences, natural " +
+	"spoken English (contractions welcome), under 35 words. No lists, no emoji, no " +
+	"questions, no placeholders. Never invent anything they did not say. Output " +
+	"only the spoken line, nothing else."
+
+// closeTranscript renders the answered slots as a compact Q/A transcript for the
+// closing prompt. Skipped/empty slots are omitted so the model can't reference a
+// question the respondent never actually engaged with.
+func closeTranscript(sv *survey.Survey) string {
+	var b strings.Builder
+	for _, q := range sv.Questions {
+		a := strings.TrimSpace(q.Answer)
+		if q.Status != survey.Answered || a == "" {
+			continue
+		}
+		b.WriteString("Q: ")
+		b.WriteString(strings.TrimSpace(q.Text))
+		b.WriteString("\nA: ")
+		b.WriteString(a)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// sanitizeClosing trims the model's farewell and rejects (returns "") anything
+// implausible — empty, multi-paragraph, or too long — so a misbehaving model
+// can never speak junk at the end. Surrounding quotes are stripped.
+func sanitizeClosing(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, `"`)
+	s = strings.TrimSpace(s)
+	// Collapse any stray newlines into single spaces (it must be one spoken line).
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" || len([]rune(s)) > 240 {
+		return ""
+	}
+	return s
+}
+
+// introLine returns the LLM-authored opening if present, else a fixed greeting.
+func introLine(intro, product string) string {
+	if s := strings.TrimSpace(intro); s != "" {
+		return s
+	}
+	return "Hi! A few quick questions about " + product + ". There are no wrong answers. Here's the first:"
 }
 
 // withLead prepends a spoken acknowledgment to the next line, if present.
@@ -368,11 +457,11 @@ func (cv *conversation) greetAndAskFirst() {
 	// the first question as two separate clips (the second would cut off the first).
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	// Keep the opening short so the first audio arrives fast and there's less
-	// temptation to answer over it. TTS is streamed sentence-by-sentence.
-	intro := "Hi! A few quick questions about " + cv.poll.Product +
-		". There are no wrong answers. Here's the first: " + q.Text
-	cv.emit(outMsg{Type: "agent_say", Text: intro, Kind: "question", Index: idx, Total: total}, intro)
+	// Opening line + first question in ONE clip. The greeting is LLM-authored at
+	// poll creation (product-aware, warm); we fall back to a fixed line if it's
+	// missing. TTS is streamed sentence-by-sentence, so the first words arrive fast.
+	opening := withLead(introLine(cv.poll.Intro, cv.poll.Product), q.Text)
+	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
 }
 
 // ---- transport helpers ----

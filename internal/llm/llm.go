@@ -1,5 +1,6 @@
 // Package llm talks to a local Ollama daemon. It does two jobs:
-//   - GenerateQuestions: one-shot creation of poll questions from a product.
+//   - GenerateSurvey: one-shot creation of poll questions AND a warm,
+//     product-tailored opening line from a product description.
 //   - ClassifyTurn: a cheap per-turn read of what the respondent's reply means
 //     (answered / wants to stop / off-topic) plus whether it's a sufficient
 //     answer. This drives follow-ups and early bail-out.
@@ -54,24 +55,45 @@ func (c *Client) chat(ctx context.Context, temp float64, format json.RawMessage,
 
 // ---- Question generation ----
 
-type questionsOut struct {
+// SurveyPlan is a freshly generated survey: its questions plus a warm,
+// product-tailored opening line the agent speaks before the first question.
+// Intro is best-effort — it may be empty, in which case the caller falls back
+// to a fixed greeting.
+type SurveyPlan struct {
+	Questions []string
+	Intro     string
+}
+
+type surveyOut struct {
+	Intro     string   `json:"intro"`
 	Questions []string `json:"questions"`
 }
 
-// GenerateQuestions asks the model for 3-5 concise, spoken-style poll questions
-// about the given product. Retries once on malformed JSON.
-func (c *Client) GenerateQuestions(ctx context.Context, product string) ([]string, error) {
-	sys := "You write short opinion-poll questions for a VOICE survey. " +
-		"The questions will be read aloud and answered by speaking, so keep each " +
-		"one to a single, natural, conversational sentence. No numbering, no preamble. " +
-		"Ask about the respondent's honest opinion, experience, and suggestions. " +
+// GenerateSurvey asks the model, in ONE call, for 3-5 concise spoken-style poll
+// questions about the product AND a short, warm opening line to greet the
+// respondent. Retries once on malformed JSON. The intro is optional: a missing
+// or oversized one comes back empty so the caller can fall back to a fixed line.
+func (c *Client) GenerateSurvey(ctx context.Context, product string) (SurveyPlan, error) {
+	sys := "You set up a spoken VOICE opinion survey. You produce two things.\n\n" +
+		"1) INTRO: one warm, natural opening line the agent SAYS OUT LOUD before the " +
+		"first question. Greet the respondent, mention there are just a few quick " +
+		"questions about the product, reassure them there are no wrong answers " +
+		"(you want their honest take), and end with a short hand-off like " +
+		"\"Here's the first:\" or \"Let's start:\". Keep it to 1-2 short sentences, " +
+		"conversational and spoken (contractions are good). Do NOT include any actual " +
+		"question in the intro. Do NOT say a specific number of questions — say " +
+		"\"a few\". No emoji.\n\n" +
+		"2) QUESTIONS: 3 to 5 poll questions, each read aloud and answered by " +
+		"speaking, so each is a single natural conversational sentence. No numbering, " +
+		"no preamble. Ask about the respondent's honest opinion, experience, and " +
+		"suggestions.\n\n" +
 		"NEVER use placeholders or brackets like [Name] or [Restaurant Name]; if a " +
-		"specific detail is unknown, phrase the question generally (e.g. 'our candles')."
+		"specific detail is unknown, phrase things generally (e.g. 'our candles')."
 	user := fmt.Sprintf("Product / topic: %s\n\n"+
-		"Write 3 to 5 poll questions. Respond ONLY as JSON: "+
-		`{"questions": ["...", "..."]}`, strings.TrimSpace(product))
+		"Respond ONLY as JSON: "+
+		`{"intro": "...", "questions": ["...", "..."]}`, strings.TrimSpace(product))
 
-	format := json.RawMessage(`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}`)
+	format := json.RawMessage(`{"type":"object","properties":{"intro":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}}},"required":["intro","questions"]}`)
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -80,9 +102,9 @@ func (c *Client) GenerateQuestions(ctx context.Context, product string) ([]strin
 			{Role: "user", Content: user},
 		})
 		if err != nil {
-			return nil, err
+			return SurveyPlan{}, err
 		}
-		var out questionsOut
+		var out surveyOut
 		if err := json.Unmarshal([]byte(raw), &out); err != nil {
 			lastErr = fmt.Errorf("bad JSON from model: %w (%q)", err, raw)
 			continue
@@ -95,9 +117,22 @@ func (c *Client) GenerateQuestions(ctx context.Context, product string) ([]strin
 		if len(qs) > 5 {
 			qs = qs[:5]
 		}
-		return qs, nil
+		return SurveyPlan{Questions: qs, Intro: cleanIntro(out.Intro)}, nil
 	}
-	return nil, lastErr
+	return SurveyPlan{}, lastErr
+}
+
+// cleanIntro trims the generated opening line and drops it (returns "") if it's
+// empty or implausibly long, so a rambling small-model intro can't hijack the
+// greeting — the caller falls back to the fixed line instead.
+func cleanIntro(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, `"`)
+	s = strings.TrimSpace(s)
+	if s == "" || len([]rune(s)) > 300 {
+		return ""
+	}
+	return s
 }
 
 func cleanQuestions(in []string) []string {

@@ -60,6 +60,15 @@ func main() {
 		log.Fatalf("classifier: %v", err)
 	}
 
+	// The closing sign-off is written by the SAME model that classifies turns —
+	// it's the conversation's "brain", so it also authors the personalized
+	// farewell that references what the respondent actually said. One-shot, at
+	// end of call, so latency doesn't matter; falls back to a fixed line on error.
+	closer, err := llm.NewCompleter(cm, anthropicKey)
+	if err != nil {
+		log.Fatalf("closing completer: %v", err)
+	}
+
 	// The insight scorer is a fully independent one-shot Completer pass, routed
 	// the same way (Ollama offline by default, or Anthropic). It never touches
 	// the classify/ask path.
@@ -80,7 +89,7 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))
@@ -134,13 +143,13 @@ func (a *app) createPoll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	questions, err := a.llm.GenerateQuestions(ctx, req.Product)
+	plan, err := a.llm.GenerateSurvey(ctx, req.Product)
 	if err != nil {
 		log.Printf("question gen failed: %v", err)
 		http.Error(w, "could not generate questions", http.StatusBadGateway)
 		return
 	}
-	poll := a.store.Create(req.Product, questions)
+	poll := a.store.Create(req.Product, plan.Questions, plan.Intro)
 	writeJSON(w, map[string]any{
 		"id":        poll.ID,
 		"questions": poll.Questions,
