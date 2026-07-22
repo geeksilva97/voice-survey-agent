@@ -52,6 +52,10 @@
         <input id="link" readonly>
         <a id="open" href="#">Open →</a>
       </div>
+      <div class="linkrow" style="margin-top:10px">
+        <a id="results" href="#" style="flex:1; text-align:center; background:transparent; color:var(--acc); border:1px solid var(--line);">View results</a>
+        <a id="insights" href="#" style="flex:1; text-align:center; background:transparent; color:var(--acc); border:1px solid var(--line);">View scored insights</a>
+      </div>
     </div>
   </div>
 </div>
@@ -98,6 +102,8 @@ go.onclick = async () => {
     const url = location.origin + data.poll_url;
     document.getElementById("link").value = url;
     document.getElementById("open").href = data.poll_url;
+    document.getElementById("results").href = "/results/" + data.id;
+    document.getElementById("insights").href = "/insights/" + data.id;
     document.getElementById("result").classList.add("show");
   } catch (e) {
     err.textContent = "Could not generate: " + e.message;

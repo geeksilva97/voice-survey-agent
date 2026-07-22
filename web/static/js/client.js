@@ -220,5 +220,7 @@ function finish(reason) {
     silence: "⏳ Session ended. Thanks for stopping by!",
   };
   el("endmsg").textContent = msgs[reason] || "Thanks!";
+  el("endresults").href = "/results/" + pollId;
+  el("endinsights").href = "/insights/" + pollId;
   barfill.style.width = "100%";
 }
