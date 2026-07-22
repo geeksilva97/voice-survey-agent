@@ -85,11 +85,24 @@ func (e *Engine) SetVoice(id int) { e.voiceID = id }
 // Synthesize renders text to a mono 16-bit PCM WAV (ready to hand to the
 // browser as a binary blob for decodeAudioData / <audio>).
 func (e *Engine) Synthesize(text string) ([]byte, error) {
+	return e.SynthesizeVoice(text, e.voiceID)
+}
+
+// SynthesizeVoice renders text with a SPECIFIC Kokoro voice id without changing
+// the engine's default voice. Used by the QA harness so each simulated persona
+// can speak in a distinct voice while the agent keeps its own. Falls back to the
+// default voice if the requested id yields no audio.
+func (e *Engine) SynthesizeVoice(text string, voiceID int) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	audio := e.tts.Generate(text, e.voiceID, 1.0)
+	audio := e.tts.Generate(text, voiceID, 1.0)
 	if audio == nil || len(audio.Samples) == 0 {
-		return nil, fmt.Errorf("tts produced no audio for %q", text)
+		if voiceID != e.voiceID {
+			audio = e.tts.Generate(text, e.voiceID, 1.0)
+		}
+		if audio == nil || len(audio.Samples) == 0 {
+			return nil, fmt.Errorf("tts produced no audio for %q", text)
+		}
 	}
 	return encodeWAV(audio.Samples, audio.SampleRate), nil
 }

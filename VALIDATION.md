@@ -382,6 +382,27 @@ Harness files (committed, reusable):
 - `scripts/browser-e2e/fakemic.js` — inject as an **init script** (before page load)
 - `scripts/browser-e2e/autoanswer.js` — inject **after clicking Start**
 
+### Persona-driven QA (simulated respondents, on demand)
+
+Beyond the fixed clips, the browser suite can drive **LLM-simulated personas**
+whose answers are generated on demand and synthesized in a distinct voice, then
+played into the fake mic — so each run exercises fresh language through the real
+VAD → STT → classifier path. Run the server with `-qa` to mount the dev-only
+endpoint `POST /api/qa/reply`; inject `scripts/browser-e2e/persona-answerer.js`
+with `window.__persona` set. Full walkthrough (fake mic, the round-trip, the
+endpoint, how to run) in **`docs/BROWSER-QA.md`**.
+
+Built-in personas and what each asserts (`internal/qa/personas.go`):
+
+| Persona | Asserts | Last run (2026-07-22, sonnet classify, candles) |
+|---------|---------|--------------------------------------------------|
+| Enthusiast | `completed`, all slots | ✅ `completed` 5/5, personalized close |
+| Neutral | `completed`, vague accepted, no re-ask loop | ✅ `completed` 2/2 |
+| Rusher | `bailed` mid-survey | ✅ `bailed` (answered Q1, bailed Q2) |
+| Confused | `needs_help` fires, then completes | ✅ `needs_help` → re-pose → `completed` 2/2 |
+
+`internal/qa` is unit tested (`TestFind`, `TestReplyUser`, `TestPersonaIDs`).
+
 ### Prep (once)
 
 ```bash
