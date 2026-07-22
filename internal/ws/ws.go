@@ -126,7 +126,8 @@ type conversation struct {
 	speaking   bool // true while we expect the client to be playing audio
 	strikes    int  // consecutive silence nudges
 	reasks     int  // times we've re-read the current question
-	inGreeting bool // awaiting the reply to the opening "how's your day" small-talk
+	inGreeting    bool // awaiting the reply to the opening "how's your day" small-talk
+	awaitingStart bool // greeting done + framed; awaiting a "ready?" go-ahead before Q1
 
 	// Conversational repair: when an answer is understood-but-unclear (calque /
 	// heavy ESL / ambiguous), the agent confirms ONCE before advancing. Capped
@@ -236,6 +237,11 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 	// The opening small-talk reply is handled separately — it's not a survey slot.
 	if cv.inGreeting {
 		return cv.handleGreeting(text)
+	}
+	// After framing the survey the agent asked "ready?"; this reply is the
+	// go-ahead (or an early bail) — still not a survey slot.
+	if cv.awaitingStart {
+		return cv.handleStart(text)
 	}
 
 	q, ok := cv.sv.Current()
@@ -506,42 +512,57 @@ func (cv *conversation) greetAndAskFirst() {
 // we hand the classifier when reading the reply.
 const greetingQuestion = "How's your day going so far?"
 
-// openGreeting speaks the warm hello (the agent introduces herself by name, says
-// she'll ask a few quick questions about the product, and asks how the day is
-// going) and waits for the reply. Touches no survey state.
+// openGreeting speaks a short, human hello — the agent introduces herself by
+// name (time-of-day aware) and asks how the person's day is going. It does NOT
+// mention the survey or the product yet: a real person says hi and listens
+// before getting to business. Touches no survey state.
 func (cv *conversation) openGreeting() {
 	cv.inGreeting = true
-	line := greetingLine(cv.h.AgentName, cv.poll.Product)
+	line := greetingLine(cv.h.AgentName, timeOfDay(time.Now()))
 	cv.emit(outMsg{Type: "agent_say", Text: line, Kind: "greeting"}, line)
 }
 
-// greetingTemplates are curated spoken openers. Each introduces the agent by
-// name, frames the survey (a few quick questions about the product), and ends by
-// asking how the person's day is going. We use hand-written templates rather
-// than LLM generation because the offline question-gen model (3B) proved too
-// weak to self-introduce reliably (it addressed the respondent by the agent's
-// name). %[1]s = agent name, %[2]s = product. Picked at random per session so
-// the opener varies. Keep every variant ending on a "how are you" so the reply
-// is a wellbeing answer the classifier can read.
+// greetingTemplates are curated spoken openers — just a warm, human hello: the
+// agent's name, a time-aware salutation, and a "how are you". No agenda, no
+// product: that comes AFTER she's heard how they're doing (see composeGreetingLead),
+// the way a person eases into a conversation. We use hand-written templates
+// rather than LLM generation because the offline question-gen model (3B) proved
+// too weak to self-introduce reliably. %[1]s = agent name, %[2]s = time of day
+// ("morning"/"afternoon"/"evening"). Picked at random per session so it varies.
+// Keep every variant ending on a "how are you" so the reply is a wellbeing
+// answer the classifier can read.
 var greetingTemplates = []string{
-	"Hi there, I'm %[1]s! I've got just a few quick questions about %[2]s — but first, how's your day going?",
-	"Hey, %[1]s here! Before we get into a few quick questions about %[2]s, how are you doing today?",
-	"Hello! My name's %[1]s, and I'll ask you a handful of quick questions about %[2]s. But tell me first — how's your day treating you?",
-	"Hi! I'm %[1]s. In a moment I'll ask a few quick questions about %[2]s, but first — how are you today?",
+	"Hi there! I'm %[1]s. How's your %[2]s going so far?",
+	"Hey, %[1]s here — good %[2]s! How are you doing today?",
+	"Good %[2]s! My name's %[1]s. How's your day treating you?",
+	"Hi! I'm %[1]s. How's everything going this %[2]s?",
 }
 
-// greetingLine fills a random greeting template with the agent name and product.
-func greetingLine(name, product string) string {
+// greetingLine fills a random greeting template with the agent name and the
+// current time of day.
+func greetingLine(name, tod string) string {
 	if name = strings.TrimSpace(name); name == "" {
 		name = "Ava"
 	}
-	return fmt.Sprintf(greetingTemplates[rand.Intn(len(greetingTemplates))], name, strings.TrimSpace(product))
+	return fmt.Sprintf(greetingTemplates[rand.Intn(len(greetingTemplates))], name, tod)
 }
 
-// handleGreeting reads the reply to the opening small-talk. It reuses the turn
-// classifier (one call, no extra latency) for two things: catch an early bail,
-// and get a warm, SPECIFIC caring line (the ack) to open the survey with. It's a
-// single exchange — we never loop on the greeting, so the survey starts promptly.
+// timeOfDay buckets a clock time into a spoken salutation word.
+func timeOfDay(t time.Time) string {
+	switch h := t.Hour(); {
+	case h < 12:
+		return "morning"
+	case h < 18:
+		return "afternoon"
+	default:
+		return "evening"
+	}
+}
+
+// handleGreeting reads the reply to the opening small-talk. It first runs the
+// turn classifier once to catch an early bail ("actually I don't have time"),
+// then authors Ava's spoken reply + hand-off into the survey. It's a single
+// exchange — we never loop on the greeting, so the survey starts promptly.
 func (cv *conversation) handleGreeting(text string) bool {
 	cv.inGreeting = false
 
@@ -562,17 +583,148 @@ func (cv *conversation) handleGreeting(text string) bool {
 		return true
 	}
 
-	// Reflect their day back warmly, then move into the survey. Fall back to a
-	// neutral-warm line when the model gave no ack (weaker models under-produce).
-	care := strings.TrimSpace(turn.Ack)
-	if care == "" {
-		care = "Thanks — glad you're here."
-	}
-	return cv.startSurvey(care)
+	// Author a reply that reacts to what they said, frames the survey (count +
+	// purpose), and ends by ASKING if they're ready — a human consent beat. We
+	// don't ask the first question yet; we wait for their go-ahead (handleStart).
+	cv.awaitingStart = true
+	lead := cv.composeGreetingLead(text, strings.TrimSpace(turn.Ack))
+	cv.speak(lead, "greeting")
+	return false
 }
 
-// startSurvey speaks the first question, led by the caring line from the
-// greeting and a short framing bridge (no second "hi" — we already greeted).
+// handleStart reads the reply to the "ready?" check. A bail still ends the call;
+// anything else is taken as the go-ahead, and we open the survey with a short
+// warm lead. Like the greeting, it's a single exchange — no looping.
+func (cv *conversation) handleStart(text string) bool {
+	cv.awaitingStart = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	turn, err := cv.h.LLM.ClassifyTurn(ctx, "Are you ready to start the questions?", text)
+	if err != nil {
+		log.Printf("start classify error: %v", err)
+		turn = llm.Turn{Intent: llm.IntentAnswer}
+	}
+	if turn.Intent == llm.IntentWantsStop {
+		cv.sv.Bail()
+		cv.persist()
+		cv.speak("No problem at all — thanks so much for the time you gave us. Take care!", "closing")
+		cv.finalize(survey.Bailed)
+		return true
+	}
+
+	lead := strings.TrimSpace(turn.Ack)
+	if lead == "" {
+		lead = "Great —"
+	}
+	return cv.startSurvey(lead)
+}
+
+// composeGreetingLead writes Ava's spoken response to the small-talk answer plus
+// a natural hand-off into the survey. It uses the Closer completer (the same
+// "brain" that authors the closing) so she genuinely engages — answering a
+// "how about you?", acknowledging a busy day — instead of steamrolling into the
+// questions. Falls back to a warm ack + fixed framing line when no completer is
+// wired or the model returns something implausible.
+func (cv *conversation) composeGreetingLead(reply, ackFallback string) string {
+	product := strings.TrimSpace(cv.poll.Product)
+	purpose := strings.TrimSpace(cv.poll.Purpose)
+	_, count := cv.sv.Progress() // total number of questions
+	if cv.h.Closer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		user := fmt.Sprintf("Time of day: %s.\nThey just said: %q\n\nWrite your spoken reply, ending with the hand-off into the survey.",
+			timeOfDay(time.Now()), strings.TrimSpace(reply))
+		raw, err := cv.h.Closer.Complete(ctx, greetingReplySystem(cv.h.AgentName, product, purpose, count), user)
+		if err != nil {
+			log.Printf("greeting response degraded, using fixed framing: %v", err)
+		} else if s := sanitizeSpoken(raw, 320); s != "" {
+			return s
+		}
+	}
+
+	// Fallback: a warm ack + a fixed framing line that still sets expectations
+	// (how many questions, what it's for) so the survey never starts cold.
+	if ackFallback == "" {
+		ackFallback = "Thanks — glad you're here."
+	}
+	return withLead(ackFallback, fixedFraming(product, purpose, count))
+}
+
+// fixedFraming is the deterministic "here's what we'll do" line used when no
+// completer is wired or the model misbehaves. It states the question count and,
+// when given, the survey's purpose, then asks if they're ready to start.
+func fixedFraming(product, purpose string, count int) string {
+	var b strings.Builder
+	b.WriteString("So — I've got ")
+	if count > 0 {
+		b.WriteString(fmt.Sprintf("%s quick question%s", numberWord(count), plural(count)))
+	} else {
+		b.WriteString("a few quick questions")
+	}
+	if product != "" {
+		b.WriteString(" about " + product)
+	}
+	if purpose != "" {
+		b.WriteString(", to " + purpose)
+	}
+	b.WriteString(". Sound good?")
+	return b.String()
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// numberWord spells small counts for natural speech; larger ones fall back to
+// digits.
+func numberWord(n int) string {
+	words := []string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+	if n >= 0 && n <= 10 {
+		return words[n]
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// greetingReplySystem builds the prompt for Ava's small-talk reply. She must
+// react to what they actually said FIRST (reciprocate, acknowledge a busy day),
+// then set expectations (how many questions, what it's for) and hand off WITHOUT
+// asking the first question herself — the verbatim question is appended after.
+func greetingReplySystem(name, product, purpose string, count int) string {
+	if name = strings.TrimSpace(name); name == "" {
+		name = "Ava"
+	}
+	about := "the product"
+	if product != "" {
+		about = product
+	}
+	countClause := "a few quick questions"
+	if count > 0 {
+		countClause = fmt.Sprintf("%s question%s", numberWord(count), plural(count))
+	}
+	purposeClause := "."
+	if purpose != "" {
+		purposeClause = ", and weave in the goal as a SHORT phrase (compress it, don't recite it word-for-word): " + purpose + "."
+	}
+	return fmt.Sprintf("You are %[1]s, a warm, personable voice-survey host. You just said hello and asked "+
+		"how the person's day is going, and they replied. Write %[1]s's SHORT spoken reply and hand-off. "+
+		"This is SPOKEN aloud, so keep it tight and easy to listen to — a wall of text is painful to hear. "+
+		"STRUCTURE, in this order: (1) ONE brief, genuine reaction to what they ACTUALLY said — if they "+
+		"asked how you are, answer in a few words; if they're busy, a quick nod. Don't overdo it. "+
+		"(2) ONE smooth transition into the survey — pick a single connective like \"So,\" and NEVER stack "+
+		"two (no \"so... okay, let's get into it\"). (3) In that sentence, say you've got %[3]s about %[2]s%[4]s "+
+		"then END BY ASKING IF THEY'RE READY to start (e.g. \"sound good?\", \"ready when you are?\"). "+
+		"HARD LIMITS: at most 2 short sentences plus the ready-check, under 35 words total, and never "+
+		"repeat a word like \"quick\" twice. Do NOT ask any of the actual survey questions and do NOT start "+
+		"answering them — only check they're ready. Natural spoken English, contractions welcome. No "+
+		"lists, no emoji, no placeholders, no stage directions. Output only the spoken words.", name, about, countClause, purposeClause)
+}
+
+// startSurvey speaks the first question, led by the authored greeting response
+// (which already reacted and framed the survey — no second "hi").
 func (cv *conversation) startSurvey(lead string) bool {
 	q, ok := cv.sv.Current()
 	if !ok {
@@ -580,18 +732,24 @@ func (cv *conversation) startSurvey(lead string) bool {
 	}
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	opening := surveyOpening(lead, q.Text)
+	opening := withLead(lead, q.Text)
 	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
 	return false
 }
 
-// surveyOpening composes the post-greeting first turn: caring lead + a brief
-// bridge + the first question, all in one clip (half-duplex). The greeting
-// already named the product and introduced the agent, so the bridge only adds a
-// light reassurance and hands off — no second greeting or product restatement.
-func surveyOpening(lead, question string) string {
-	bridge := "Alright — no wrong answers here, just your honest take. Here's the first:"
-	return withLead(lead, withLead(bridge, question))
+// sanitizeSpoken trims a model-authored spoken line and rejects (returns "")
+// anything implausible — empty or too long — so a misbehaving model can never
+// speak junk. Surrounding quotes are stripped and stray newlines collapsed.
+// Unlike sanitizeClosing it tolerates a question mark (Ava may reciprocate).
+func sanitizeSpoken(raw string, maxRunes int) string {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, `"'`)
+	s = strings.TrimSpace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" || len([]rune(s)) > maxRunes {
+		return ""
+	}
+	return s
 }
 
 // ---- transport helpers ----

@@ -82,7 +82,7 @@ type surveyOut struct {
 // questions about the product AND a short, warm opening line to greet the
 // respondent. Retries once on malformed JSON. The intro is optional: a missing
 // or oversized one comes back empty so the caller can fall back to a fixed line.
-func (c *Client) GenerateSurvey(ctx context.Context, product string) (SurveyPlan, error) {
+func (c *Client) GenerateSurvey(ctx context.Context, product, purpose string) (SurveyPlan, error) {
 	sys := "You set up a spoken VOICE opinion survey. You produce two things.\n\n" +
 		"1) INTRO: one warm, natural opening line the agent SAYS OUT LOUD before the " +
 		"first question. Greet the respondent, mention there are just a few quick " +
@@ -96,11 +96,22 @@ func (c *Client) GenerateSurvey(ctx context.Context, product string) (SurveyPlan
 		"speaking, so each is a single natural conversational sentence. No numbering, " +
 		"no preamble. Ask about the respondent's honest opinion, experience, and " +
 		"suggestions.\n\n" +
+		"CRITICAL: If a SURVEY GOAL is given, the questions MUST focus specifically on " +
+		"that goal — every question should dig into what the goal actually wants to " +
+		"learn. Do NOT drift into generic questions that ignore the goal. Use the " +
+		"concrete details in the product description and goal (specific dishes, " +
+		"features, regions, changes) so the questions are clearly about THIS survey, " +
+		"not any survey.\n\n" +
 		"NEVER use placeholders or brackets like [Name] or [Restaurant Name]; if a " +
 		"specific detail is unknown, phrase things generally (e.g. 'our candles')."
-	user := fmt.Sprintf("Product / topic: %s\n\n"+
+	goal := strings.TrimSpace(purpose)
+	goalLine := ""
+	if goal != "" {
+		goalLine = fmt.Sprintf("Survey goal (what we most want to learn): %s\n", goal)
+	}
+	user := fmt.Sprintf("Product / topic: %s\n%s\n"+
 		"Respond ONLY as JSON: "+
-		`{"intro": "...", "questions": ["...", "..."]}`, strings.TrimSpace(product))
+		`{"intro": "...", "questions": ["...", "..."]}`, strings.TrimSpace(product), goalLine)
 
 	format := json.RawMessage(`{"type":"object","properties":{"intro":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}}},"required":["intro","questions"]}`)
 

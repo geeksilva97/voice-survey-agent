@@ -38,10 +38,12 @@
   <p class="sub">Describe what you sell. We'll generate a few questions and give you a link — respondents answer by talking to a voice agent.</p>
 
   <div class="card">
-    <label>Pick a preset or describe your product</label>
+    <label>Pick a scenario or describe your own</label>
     <div class="presets" id="presets"></div>
     <textarea id="product" placeholder="e.g. hand-poured scented soy candles for the home"></textarea>
-    <button class="go" id="go">Generate questions & link</button>
+    <label style="margin-top:16px">What's this survey for? <span style="font-weight:400; opacity:.6">(optional — the agent says it out loud)</span></label>
+    <input id="purpose" style="width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit;" placeholder="e.g. understand how happy customers are with the scent and burn time">
+    <button class="go" id="go" style="margin-top:16px">Generate questions & link</button>
     <div class="err" id="err"></div>
 
     <div class="result" id="result">
@@ -61,22 +63,40 @@
 </div>
 
 <script>
+// Scenario presets: each fills the product AND a matching survey goal, so the
+// generated questions (and the agent's spoken framing) target the actual use
+// case — launching, feature testing, satisfaction, churn, and so on.
 const PRESETS = [
-  ["Scented candles", "hand-poured scented soy candles for the home"],
-  ["Coffee shop", "a neighborhood specialty coffee shop"],
-  ["SaaS app", "a project-management SaaS app for small teams"],
-  ["Restaurant", "a casual farm-to-table restaurant"],
-  ["Apparel brand", "a sustainable everyday apparel brand"],
+  ["Launching a product",
+    "hand-poured scented soy candles for the home",
+    "gauge first impressions of our newly launched product — what stands out, and whether they'd buy it"],
+  ["Testing a new feature",
+    "a project-management SaaS app for small teams",
+    "learn how our new feature is landing — is it useful, confusing, or missing anything"],
+  ["New menu / dishes",
+    "a casual farm-to-table restaurant",
+    "get honest opinions on the new dishes we just added to the menu"],
+  ["Customer satisfaction",
+    "a neighborhood specialty coffee shop",
+    "measure how satisfied customers are and what would make them come back"],
+  ["Churn / cancellation",
+    "a subscription meal-kit delivery service",
+    "understand why customers are cancelling and what could have kept them"],
+  ["Post-event feedback",
+    "a two-day industry conference",
+    "find out what attendees valued most and what we should change next time"],
 ];
 const presetsEl = document.getElementById("presets");
 const productEl = document.getElementById("product");
-PRESETS.forEach(([label, text]) => {
+const purposeEl = document.getElementById("purpose");
+PRESETS.forEach(([label, product, purpose]) => {
   const b = document.createElement("button");
   b.className = "chip"; b.textContent = label;
   b.onclick = () => {
     document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
     b.classList.add("active");
-    productEl.value = text;
+    productEl.value = product;
+    purposeEl.value = purpose || "";
   };
   presetsEl.appendChild(b);
 });
@@ -85,6 +105,7 @@ const go = document.getElementById("go");
 const err = document.getElementById("err");
 go.onclick = async () => {
   const product = productEl.value.trim();
+  const purpose = purposeEl.value.trim();
   err.textContent = "";
   if (!product) { err.textContent = "Please describe your product first."; return; }
   go.disabled = true;
@@ -92,7 +113,7 @@ go.onclick = async () => {
   try {
     const r = await fetch("/api/polls", {
       method: "POST", headers: {"content-type":"application/json"},
-      body: JSON.stringify({ product }),
+      body: JSON.stringify({ product, purpose }),
     });
     if (!r.ok) throw new Error(await r.text() || r.statusText);
     const data = await r.json();

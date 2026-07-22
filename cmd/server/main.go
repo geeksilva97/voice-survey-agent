@@ -137,6 +137,7 @@ func noCache(h http.Handler) http.Handler {
 func (a *app) createPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Product string `json:"product"`
+		Purpose string `json:"purpose"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Product) == "" {
 		http.Error(w, "missing product", http.StatusBadRequest)
@@ -145,13 +146,13 @@ func (a *app) createPoll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	plan, err := a.llm.GenerateSurvey(ctx, req.Product)
+	plan, err := a.llm.GenerateSurvey(ctx, req.Product, req.Purpose)
 	if err != nil {
 		log.Printf("question gen failed: %v", err)
 		http.Error(w, "could not generate questions", http.StatusBadGateway)
 		return
 	}
-	poll := a.store.Create(req.Product, plan.Questions, plan.Intro)
+	poll := a.store.Create(req.Product, strings.TrimSpace(req.Purpose), plan.Questions, plan.Intro)
 	writeJSON(w, map[string]any{
 		"id":        poll.ID,
 		"questions": poll.Questions,

@@ -3,6 +3,7 @@ package ws
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"voicesurvey/internal/llm"
 	"voicesurvey/internal/survey"
@@ -80,41 +81,100 @@ func TestFollowUpPrompt(t *testing.T) {
 	}
 }
 
-// TestSurveyOpening: after the greeting, the first turn leads with the caring
-// line, adds a brief bridge (no second "hi", no product restatement — the
-// greeting already covered those), and ends with the question.
-func TestSurveyOpening(t *testing.T) {
-	q := "How do you like the scent?"
-	got := surveyOpening("Glad to hear!", q)
-	if !strings.HasPrefix(got, "Glad to hear!") {
-		t.Errorf("opening should lead with the caring line; got %q", got)
+// TestSanitizeSpoken: a good line is kept (quotes stripped, newlines collapsed)
+// and a question mark is tolerated (Ava may reciprocate); empty or oversized
+// output is rejected so the fixed framing line is used instead.
+func TestSanitizeSpoken(t *testing.T) {
+	if got := sanitizeSpoken("  \"I'm great, thanks for asking!\nHere's the first one:\"  ", 260); got != "I'm great, thanks for asking! Here's the first one:" {
+		t.Errorf("sanitizeSpoken should strip quotes and collapse newlines; got %q", got)
 	}
-	if !strings.HasSuffix(got, q) {
-		t.Errorf("opening should end with the question; got %q", got)
+	if got := sanitizeSpoken("Doing well — how about you? Let's dive in:", 260); !strings.Contains(got, "?") {
+		t.Errorf("a reciprocating question mark should be tolerated; got %q", got)
 	}
-	if strings.Contains(strings.ToLower(got), "hi ") || strings.Contains(got, "Hello") {
-		t.Errorf("opening must not greet again after the greeting turn; got %q", got)
+	if got := sanitizeSpoken("   ", 260); got != "" {
+		t.Errorf("empty line should be rejected; got %q", got)
 	}
-	// No caring lead (empty ack) → still a clean bridge + question, no dangling space.
-	if got := surveyOpening("", q); !strings.HasPrefix(got, "Alright") {
-		t.Errorf("empty lead should start with the bridge; got %q", got)
+	if got := sanitizeSpoken(strings.Repeat("blah ", 100), 260); got != "" {
+		t.Errorf("oversized line should be rejected so the fixed framing is used; got %q", got)
 	}
 }
 
-// TestGreetingLine: every template introduces the agent by name, names the
-// product, and asks how they are (so the reply is a wellbeing answer). Blank
-// name defaults to Ava.
+// TestGreetingReplySystem: the small-talk reply prompt must name the agent and
+// product, state the question count and purpose, and forbid asking the survey
+// question itself (it gets appended).
+func TestGreetingReplySystem(t *testing.T) {
+	p := greetingReplySystem("Ava", "hand-poured candles", "see how happy customers are", 3)
+	if !strings.Contains(p, "Ava") || !strings.Contains(p, "hand-poured candles") {
+		t.Errorf("prompt should name the agent and product; got %q", p)
+	}
+	if !strings.Contains(p, "three questions") {
+		t.Errorf("prompt should state the question count in words; got %q", p)
+	}
+	if !strings.Contains(p, "see how happy customers are") {
+		t.Errorf("prompt should state the survey purpose; got %q", p)
+	}
+	if !strings.Contains(strings.ToLower(p), "do not ask") {
+		t.Errorf("prompt must forbid asking the survey question; got %q", p)
+	}
+	// Blank name/product/purpose and unknown count → safe generic phrasing.
+	fb := greetingReplySystem("  ", "", "", 0)
+	if !strings.Contains(fb, "Ava") || !strings.Contains(fb, "the product") || !strings.Contains(fb, "a few quick questions") {
+		t.Errorf("blanks should default (Ava / the product / a few quick questions); got %q", fb)
+	}
+	if strings.Contains(fb, "it's to ") {
+		t.Errorf("no purpose should omit the goal clause; got %q", fb)
+	}
+}
+
+// TestFixedFraming: the deterministic fallback states the spelled-out count,
+// the product, and (when given) the purpose, and ends by asking if they're ready.
+func TestFixedFraming(t *testing.T) {
+	got := fixedFraming("hand-poured candles", "measure satisfaction", 3)
+	for _, want := range []string{"three quick questions", "about hand-poured candles", "to measure satisfaction", "Sound good?"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fixedFraming missing %q; got %q", want, got)
+		}
+	}
+	// Single question → no plural "s"; no purpose → no goal clause.
+	if got := fixedFraming("candles", "", 1); !strings.Contains(got, "one quick question ") || strings.Contains(got, ", to ") {
+		t.Errorf("singular count / no purpose mishandled; got %q", got)
+	}
+	// Unknown count → generic phrasing.
+	if got := fixedFraming("", "", 0); !strings.Contains(got, "a few quick questions") {
+		t.Errorf("zero count should say 'a few quick questions'; got %q", got)
+	}
+}
+
+// TestTimeOfDay: the clock is bucketed into morning/afternoon/evening.
+func TestTimeOfDay(t *testing.T) {
+	cases := map[int]string{6: "morning", 11: "morning", 12: "afternoon", 17: "afternoon", 18: "evening", 23: "evening"}
+	for h, want := range cases {
+		if got := timeOfDay(time.Date(2026, 7, 22, h, 0, 0, 0, time.UTC)); got != want {
+			t.Errorf("timeOfDay(%02d:00) = %q, want %q", h, got, want)
+		}
+	}
+}
+
+// TestGreetingLine: every template introduces the agent by name and asks how
+// they are, but names NO product or agenda (that comes after they reply). It
+// weaves in the time of day. Blank name defaults to Ava.
 func TestGreetingLine(t *testing.T) {
 	for i := 0; i < 30; i++ {
-		g := greetingLine("Ava", "hand-poured candles")
-		if !strings.Contains(g, "Ava") || !strings.Contains(g, "hand-poured candles") {
-			t.Fatalf("greeting must name the agent and product; got %q", g)
+		g := greetingLine("Ava", "morning")
+		if !strings.Contains(g, "Ava") {
+			t.Fatalf("greeting must name the agent; got %q", g)
 		}
 		if !strings.Contains(g, "?") {
 			t.Fatalf("greeting must ask how they are; got %q", g)
 		}
+		if !strings.Contains(g, "morning") {
+			t.Fatalf("greeting must weave in the time of day; got %q", g)
+		}
+		if strings.Contains(strings.ToLower(g), "question") || strings.Contains(strings.ToLower(g), "candles") {
+			t.Fatalf("greeting must NOT mention the agenda or product; got %q", g)
+		}
 	}
-	if g := greetingLine("  ", "candles"); !strings.Contains(g, "Ava") {
+	if g := greetingLine("  ", "evening"); !strings.Contains(g, "Ava") {
 		t.Errorf("blank name should default to Ava; got %q", g)
 	}
 }

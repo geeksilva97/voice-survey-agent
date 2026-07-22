@@ -20,6 +20,10 @@ import (
 type Poll struct {
 	ID        string           `json:"id"`
 	Product   string           `json:"product"`
+	// Purpose is the customer-stated goal of the survey (e.g. "measure how happy
+	// diners are with our seasonal menu"). Optional; spoken by the agent when she
+	// frames the survey, so the respondent knows what it's for. Empty → generic.
+	Purpose   string           `json:"purpose,omitempty"`
 	Questions []string         `json:"questions"`
 	// Intro is a warm, product-tailored opening line authored by the LLM at
 	// creation time and spoken before the first question when the greeting
@@ -50,12 +54,13 @@ func NewStore(dir string) (*Store, error) {
 	return &Store{dir: dir, byID: map[string]*Poll{}}, nil
 }
 
-// Create registers a new poll from a product description, question set, and an
-// optional LLM-authored intro line.
-func (s *Store) Create(product string, questions []string, intro string) *Poll {
+// Create registers a new poll from a product description, an optional survey
+// purpose, a question set, and an optional LLM-authored intro line.
+func (s *Store) Create(product, purpose string, questions []string, intro string) *Poll {
 	p := &Poll{
 		ID:        newID(),
 		Product:   product,
+		Purpose:   purpose,
 		Questions: questions,
 		Intro:     intro,
 		CreatedAt: time.Now(),
