@@ -36,6 +36,10 @@ func main() {
 		// An off-topic aside (sports) — should classify off_topic so the agent
 		// acknowledges warmly and steers back to the question (ack layer QA).
 		"offtopic.wav": "Hey, did you catch that World Cup game last night?",
+		// A "needs help" reply — heard the question but unsure how to answer, asks
+		// the agent for guidance. Should classify needs_help so the agent reassures
+		// + hints how to answer, then re-poses the question (needs-help layer QA).
+		"unsure.wav": "Hmm, I'm not really sure how to answer that. What are you looking for?",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)

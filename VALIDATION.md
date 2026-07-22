@@ -37,11 +37,11 @@ The gate starts a throwaway server on `:8099` and tears it down.
 
 ### Intent-classification eval — `go run ./cmd/eval`
 
-The turn classifier (`answer` / `wants_stop` / `repeat` / `off_topic` /
-`unintelligible`) decides whether the agent advances, re-reads, follows up, or
-ends — so a misclassification is what makes a conversation feel wrong (e.g.
-re-asking an already-answered question). `cmd/eval` scores it against a broad
-hand-labeled corpus (`cmd/eval/dataset.go`, ~73 cases across candles/coffee/
+The turn classifier (`answer` / `wants_stop` / `repeat` / `needs_help` /
+`off_topic` / `unintelligible`) decides whether the agent advances, re-reads,
+helps, follows up, or ends — so a misclassification is what makes a conversation
+feel wrong (e.g. re-asking an already-answered question). `cmd/eval` scores it
+against a broad hand-labeled corpus (`cmd/eval/dataset.go`, ~82 cases across candles/coffee/
 restaurant/SaaS/apparel) using **live** models. Phrasings include brief, vague,
 uncertain, quirky, negative, rambling, noise, and a deliberate block of
 **broken/ESL/calque English** ("defiant" cases) that trip small models — e.g.
@@ -77,7 +77,7 @@ Per model it prints a **confusion matrix** and **failures** (including
 clarity-only misses); the matrix shows per-intent recall plus three headline
 metrics:
 
-- **Overall intent accuracy** (`acc`) — all five intents. **Gate: ≥90%.**
+- **Overall intent accuracy** (`acc`) — all six intents. **Gate: ≥90%.**
 - **Valid-answer acceptance** (`ans✓`) — of replies that *are* answers, how many
   were `answer` **and** `sufficient`. Maps to "the agent doesn't re-ask answered
   questions". **Gate: ≥95%.**
@@ -143,6 +143,36 @@ go run ./cmd/server -classify-model gemma4:31b-cloud    # or an Ollama cloud mod
 Anthropic models read the key from `$ANTHROPIC_API_KEY`, else `-anthropic-env`
 (defaults to pepita's `.env`). Ollama/`:cloud` models need no key. Every turn
 now costs a round-trip to that model, so expect a little more latency per reply.
+
+### "Needs help" — when the respondent doesn't know how to answer
+
+Some replies aren't answers, refusals, or off-topic asides — they're the person
+asking *us* how to answer: *"Do you expect some score or something?"*, *"what do
+you mean?"*, *"what are you looking for?"*. That's the `needs_help` intent. The
+agent reassures them and hints HOW to answer (the classifier's `ack` carries a
+question-specific reassurance — *"No need for a score — just your honest gut
+feeling."*), then **re-poses the same question** without advancing, so they get a
+real second shot. It shares the re-ask budget (`maxReasks`) so a confused
+respondent can't loop; after that the slot is skipped honestly.
+
+`needs_help` is deliberately NARROW: a vague, rambling, negative, or ESL/broken
+on-topic reply is still an `answer` (the dangerous confusion is reading an answer
+as needs-help and losing it), and "didn't hear it" is still `repeat`. The eval's
+`help` recall column tracks it; on the 3B it under-fires a bit (weaker models
+lean toward `answer`, which is the safe direction). `helpPrompt` is unit tested
+(`TestHelpPrompt`).
+
+### Non-speech guard (a cough is not an answer)
+
+STT annotates non-speech sounds as bracketed tokens — `(coughing)`, `(laughs)`,
+`[inaudible]`, `(background noise)`. Weak models see the word inside and treat it
+as an answer (the agent says *"Got it —"* and advances on a cough). A
+**deterministic** guard, `llm.IsNonSpeechArtifact`, runs BEFORE the model in both
+`ClassifyTurn` backends: if a reply is entirely bracketed annotation with no real
+spoken words, it's forced to `unintelligible` (so the agent re-poses, never
+advances). Model-independent — it holds even on the local 3B, which the prompt
+rule alone did not. Unit tested (`TestIsNonSpeechArtifact`); dataset covers
+`(coughing)`, `(clears throat)`, `(laughs)`.
 
 ### Acknowledgment layer (making it feel like a conversation, not a form)
 

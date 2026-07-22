@@ -43,7 +43,7 @@ import (
 
 var intents = []llm.Intent{
 	llm.IntentAnswer, llm.IntentWantsStop, llm.IntentRepeat,
-	llm.IntentOffTopic, llm.IntentUnintellig,
+	llm.IntentNeedsHelp, llm.IntentOffTopic, llm.IntentUnintellig,
 }
 
 func short(i llm.Intent) string {
@@ -54,6 +54,8 @@ func short(i llm.Intent) string {
 		return "stop"
 	case llm.IntentRepeat:
 		return "repeat"
+	case llm.IntentNeedsHelp:
+		return "help"
 	case llm.IntentOffTopic:
 		return "offtop"
 	case llm.IntentUnintellig:
@@ -279,9 +281,11 @@ func evaluate(name string, cl llm.Classifier, conc int, judge llm.Completer) rep
 }
 
 // ackExpected reports whether the agent would speak an acknowledgment for this
-// case: a clear answer (reflect-back) or an off-topic reply (warm steer-back).
+// case: a clear answer (reflect-back), an off-topic reply (warm steer-back), or
+// a needs-help reply (reassurance + hint how to answer).
 func ackExpected(c evalCase) bool {
-	return (c.want == llm.IntentAnswer && c.clarity == clear) || c.want == llm.IntentOffTopic
+	return (c.want == llm.IntentAnswer && c.clarity == clear) ||
+		c.want == llm.IntentOffTopic || c.want == llm.IntentNeedsHelp
 }
 
 func printReport(r report) {
@@ -351,8 +355,8 @@ func printReport(r report) {
 
 func printMatrix(reports []report, minAcc, minAns float64) {
 	fmt.Println("=== comparison matrix (acc/ans✓/clar/ack = headline; per-intent = recall) ===")
-	fmt.Printf("%-20s %7s %7s %7s %7s %7s %7s %7s %7s %7s %8s\n",
-		"model", "acc", "ans✓", "clar", "ack", "answer", "stop", "repeat", "offtop", "unintl", "time")
+	fmt.Printf("%-20s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %8s\n",
+		"model", "acc", "ans✓", "clar", "ack", "answer", "stop", "repeat", "help", "offtop", "unintl", "time")
 	for i, r := range reports {
 		tag := ""
 		if i == 0 {
@@ -370,12 +374,12 @@ func printMatrix(reports []report, minAcc, minAns float64) {
 		if r.ackTotal > 0 {
 			ackCell = fmt.Sprintf("%6.1f%%", 100*r.ackRate())
 		}
-		fmt.Printf("%-20s %6.1f%% %6.1f%% %6.1f%% %7s %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %7s  %s %s\n",
+		fmt.Printf("%-20s %6.1f%% %6.1f%% %6.1f%% %7s %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %7s  %s %s\n",
 			trunc20(r.model),
 			100*r.acc(), 100*r.ansRate(), 100*r.clarRate(), ackCell,
 			100*r.recall(llm.IntentAnswer), 100*r.recall(llm.IntentWantsStop),
-			100*r.recall(llm.IntentRepeat), 100*r.recall(llm.IntentOffTopic),
-			100*r.recall(llm.IntentUnintellig),
+			100*r.recall(llm.IntentRepeat), 100*r.recall(llm.IntentNeedsHelp),
+			100*r.recall(llm.IntentOffTopic), 100*r.recall(llm.IntentUnintellig),
 			r.elapsed.Round(time.Millisecond), status, tag)
 	}
 	fmt.Printf("\nthresholds: acc>=%.0f%%, answer-accept>=%.0f%%  (gate model only; clar/ack ungated)\n",
@@ -415,16 +419,19 @@ const ackJudgeSystem = "You grade a single one-line acknowledgment produced by a
 	"A GOOD ack is: short (a phrase, not a full sentence, never a question), natural and spoken, " +
 	"and SPECIFIC to what the respondent said. For a normal answer it briefly reflects their point " +
 	"back. For an OFF-TOPIC reply it lightly acknowledges the aside and steers back WITHOUT engaging " +
-	"the tangent.\n" +
+	"the tangent. For a NEEDS-HELP reply (the respondent didn't know how to answer or asked the agent " +
+	"to clarify) a good ack reassures them and hints HOW to answer, addressing their specific confusion " +
+	"('No need for a score — just your honest gut feeling.'); it should NOT restate the question.\n" +
 	"A BAD ack is: empty when one is expected, generic/templated (a bare 'Got it, thanks' with no " +
-	"specificity), phrased as a question, rude or dismissive, too long/rambly, or — for an off-topic " +
-	"reply — actually engaging the tangent.\n" +
+	"specificity), phrased as a question, rude or dismissive, too long/rambly, — for an off-topic " +
+	"reply — actually engaging the tangent, or — for a needs-help reply — unhelpful or just repeating " +
+	"the question.\n" +
 	`Respond ONLY as JSON: {"good": true|false, "reason": "a few words"}.`
 
 // judgeAck asks the judge model whether one produced ack is good.
 func judgeAck(ctx context.Context, judge llm.Completer, c evalCase, ack string) (bool, string, error) {
-	user := fmt.Sprintf("QUESTION: %s\nREPLY: %s\nOFF-TOPIC: %v\nACK: %q",
-		c.q, c.reply, c.want == llm.IntentOffTopic, ack)
+	user := fmt.Sprintf("QUESTION: %s\nREPLY: %s\nOFF-TOPIC: %v\nNEEDS-HELP: %v\nACK: %q",
+		c.q, c.reply, c.want == llm.IntentOffTopic, c.want == llm.IntentNeedsHelp, ack)
 	raw, err := judge.Complete(ctx, ackJudgeSystem, user)
 	if err != nil {
 		return false, "", err

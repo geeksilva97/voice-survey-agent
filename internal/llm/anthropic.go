@@ -136,8 +136,8 @@ type anthResp struct {
 // ClassifyTurn implements Classifier using the same shared prompt as Ollama.
 func (a *AnthropicClient) ClassifyTurn(ctx context.Context, question, reply string) (Turn, error) {
 	reply = strings.TrimSpace(reply)
-	if reply == "" {
-		return Turn{Intent: IntentUnintellig, Sufficient: false}, nil
+	if reply == "" || IsNonSpeechArtifact(reply) {
+		return Turn{Intent: IntentUnintellig, Sufficient: false, Clarity: ClarityUnclear}, nil
 	}
 	system, msgs := classifyPrompt(question, reply)
 	am := make([]anthMsg, 0, len(msgs))

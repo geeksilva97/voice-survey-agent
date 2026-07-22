@@ -99,3 +99,23 @@ func TestClassifyQuirkyAnswer(t *testing.T) {
 		})
 	}
 }
+
+// TestIsNonSpeechArtifact locks the deterministic guard that stops a cough or
+// other non-speech STT annotation from being treated as an answer (the agent
+// must never say "Got it" and advance on a cough). It runs with no network.
+func TestIsNonSpeechArtifact(t *testing.T) {
+	artifacts := []string{"(coughing)", "  (coughing)  ", "(buzzing) (buzzing)",
+		"[inaudible]", "(clears throat)", "(laughs)", "(background noise)", "(...)"}
+	for _, s := range artifacts {
+		if !IsNonSpeechArtifact(s) {
+			t.Errorf("IsNonSpeechArtifact(%q) = false, want true", s)
+		}
+	}
+	speech := []string{"", "I love the lavender one", "no idea (honestly)",
+		"it freezes (sometimes) when I open it", "great", "(cough) but yeah it's good"}
+	for _, s := range speech {
+		if IsNonSpeechArtifact(s) {
+			t.Errorf("IsNonSpeechArtifact(%q) = true, want false", s)
+		}
+	}
+}

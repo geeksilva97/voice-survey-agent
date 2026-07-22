@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/ollama/ollama/api"
 )
@@ -154,7 +156,8 @@ type Intent string
 const (
 	IntentAnswer     Intent = "answer"      // engaging with the question
 	IntentWantsStop  Intent = "wants_stop"  // wants to end the survey early
-	IntentRepeat     Intent = "repeat"      // didn't hear/understand; wants the question again
+	IntentRepeat     Intent = "repeat"      // didn't HEAR it; wants the question read again
+	IntentNeedsHelp  Intent = "needs_help"  // heard it but unsure how to answer / asks us to clarify
 	IntentOffTopic   Intent = "off_topic"   // not related to the question
 	IntentUnintellig Intent = "unintelligible"
 )
@@ -179,12 +182,13 @@ type Turn struct {
 	Clarity    Clarity `json:"clarity"`    // did we understand the content precisely?
 	// Ack is a short, warm, SPECIFIC spoken lead-in the agent says right before
 	// the next question — it reflects what the respondent just said (a normal
-	// answer) or gently steers back (an off-topic aside). It's what makes the
+	// answer), gently steers back (an off-topic aside), or, for a 'needs_help'
+	// reply, reassures them and hints how to answer. It's what makes the
 	// conversation feel human instead of a form. Empty when no lead-in fits.
 	Ack string `json:"ack"`
 }
 
-var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","repeat","off_topic","unintelligible"]},"sufficient":{"type":"boolean"},"clarity":{"type":"string","enum":["clear","unclear"]},"ack":{"type":"string"}},"required":["intent","sufficient","clarity","ack"]}`)
+var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","repeat","needs_help","off_topic","unintelligible"]},"sufficient":{"type":"boolean"},"clarity":{"type":"string","enum":["clear","unclear"]},"ack":{"type":"string"}},"required":["intent","sufficient","clarity","ack"]}`)
 
 // Msg is a provider-neutral chat message (role: system/user/assistant). It lets
 // every backend classify with the SAME prompt so model comparisons are fair.
@@ -229,6 +233,16 @@ func classifyPrompt(question, reply string) (system string, msgs []Msg) {
 		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
 		{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Sorry, what was the question?"},
 		{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear","ack":""}`},
+		{Role: "user", Content: "Question: How would you rate the quality of our coffee?\nReply: Do you expect some score or something?"},
+		{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"No need for a score — just your honest gut feeling."}`},
+		{Role: "user", Content: "Question: What's one thing you'd improve about our candles?\nReply: Hmm, I'm not really sure what you're looking for here."},
+		{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"However you'd like to answer is fine — big or small."}`},
+		{Role: "user", Content: "Question: What could we improve about the app?\nReply: No, I can't think of anything right now."},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, noted."}`},
+		{Role: "user", Content: "Question: How has our app been working for you lately?\nReply: Eh, I dunno, it's, like, mostly fine I guess, you know?"},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Mostly smooth — good to hear."}`},
+		{Role: "user", Content: "Question: What would make you shop with us more?\nReply: You should make more advertising, I never see your publicity anywhere."},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
 		{Role: "user", Content: "Question: How likely are you to recommend us?\nReply: I really have to run now, sorry."},
 		{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear","ack":""}`},
 		{Role: "user", Content: "Question: What's your favorite scent?\nReply: What time do you close today?"},
@@ -237,10 +251,35 @@ func classifyPrompt(question, reply string) (system string, msgs []Msg) {
 		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"Ha, no worries —"}`},
 		{Role: "user", Content: "Question: What do you think of our candles?\nReply: (buzzing) (buzzing)"},
 		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
+		{Role: "user", Content: "Question: How satisfied are you with the quality of our furniture?\nReply: (coughing)"},
+		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
 	}
 	user := fmt.Sprintf("Question: %s\nReply: %s", question, reply)
 	msgs = append(shots, Msg{Role: "user", Content: user})
 	return system, msgs
+}
+
+// nonSpeechAnnot matches a parenthesized or bracketed span, e.g. "(coughing)"
+// or "[inaudible]" — how STT engines annotate NON-SPEECH sounds.
+var nonSpeechAnnot = regexp.MustCompile(`[\(\[][^\)\]]*[\)\]]`)
+
+// IsNonSpeechArtifact reports whether a transcript is ENTIRELY non-speech sound
+// annotation (a cough, laugh, buzzing, [inaudible]) with no actual spoken words.
+// Weak models sometimes see the word inside the parentheses ("coughing") and
+// treat it as an answer, so we detect this deterministically and force an
+// 'unintelligible' turn — the agent must never say "Got it" and advance on a
+// cough. Requires at least one bracketed span and no alphanumeric text outside.
+func IsNonSpeechArtifact(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || !nonSpeechAnnot.MatchString(t) {
+		return false
+	}
+	for _, r := range nonSpeechAnnot.ReplaceAllString(t, "") {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeTurn parses a model's JSON label, isolating the first JSON object
@@ -280,17 +319,27 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"- 'wants_stop': they want to END THE WHOLE SURVEY now (e.g. 'I have to go', 'I'm done', " +
 	"'stop', 'no more questions', 'I'm not interested'). This is about quitting the survey, " +
 	"NOT about having nothing to say for one question.\n" +
-	"- 'repeat': they did NOT hear or understand the question and want it repeated or " +
-	"clarified (e.g. 'what was the question?', 'can you repeat that?', 'I didn't catch it', " +
-	"'I don't understand').\n" +
+	"- 'repeat': they did NOT HEAR the question (audio problem) and want it read again as-is " +
+	"(e.g. 'what was the question?', 'can you repeat that?', 'I didn't catch it', 'say that " +
+	"again?'). Use this only when they missed the words, not when they heard but are unsure.\n" +
+	"- 'needs_help': use ONLY when they do NOT give any answer of their own and instead ask YOU to " +
+	"explain or clarify the QUESTION — a question aimed back at the agent about what is being asked " +
+	"(e.g. 'what do you mean?', 'do you expect a score or something?', 'like a number, or...?', 'what " +
+	"are you looking for?', 'how should I answer that?'). It is a request for guidance, not an answer. " +
+	"Do NOT use 'needs_help' just because a reply is vague, rambling, uncertain, negative, or hard to " +
+	"parse — if they say ANYTHING on-topic of their own (including 'I can't think of anything' or a " +
+	"messy/broken suggestion), that is 'answer'. And if they simply didn't HEAR it, that is 'repeat'.\n" +
 	"- 'off_topic': the reply is real, readable speech but about something ENTIRELY " +
 	"UNRELATED to the question — e.g. asking the time or the weather, an aside directed " +
 	"at someone else ('hold on, not you'), or chatting about an unrelated subject like " +
 	"last night's game or sports. This holds EVEN when it's phrased as a statement, not a " +
 	"question — an unrelated statement is still off_topic, not an 'answer'.\n" +
-	"- 'unintelligible': ONLY when there are no real words at all — pure noise, empty, " +
-	"transcription artifacts like '(buzzing)', or random letters. If you can read actual " +
-	"words that form any statement or suggestion, it is NOT unintelligible.\n" +
+	"- 'unintelligible': there are no real SPOKEN words to act on — pure noise, empty, random " +
+	"letters, OR a transcription artifact describing a NON-SPEECH sound rather than speech, usually " +
+	"in parentheses/brackets: '(buzzing)', '(coughing)', '(laughs)', '(sneezes)', '(clears throat)', " +
+	"'(background noise)', '(music playing)'. Those are sounds, not answers, even though they contain " +
+	"a word. If you can read actual spoken words that form any statement, question, or suggestion, it " +
+	"is NOT unintelligible.\n" +
 	"- 'answer': they engaged with the question in any way.\n" +
 	"CRITICAL: This is an OPINION SURVEY. Almost ANY on-topic reply is an 'answer' with " +
 	"sufficient=true — including short, uncertain, vague, grammatically broken, or " +
@@ -299,7 +348,8 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"answer. Declining to suggest anything for THIS question ('nothing comes to mind', 'no, " +
 	"it's all good', 'I can't think of anything', 'not really') is ALSO a valid 'answer' " +
 	"(sufficient=true) — it is NOT 'wants_stop'. Only use 'off_topic' when the reply has " +
-	"nothing to do with the question. When in doubt, choose 'answer' with sufficient=true.\n" +
+	"nothing to do with the question, and only use 'needs_help' when they ask YOU to explain the " +
+	"question instead of answering it. When in doubt, choose 'answer' with sufficient=true.\n" +
 	"CLARITY:\n" +
 	"- 'clear': you understood the content precisely (this is the DEFAULT — use it for normal, " +
 	"well-formed English, including short or negative answers like 'nothing comes to mind').\n" +
@@ -317,6 +367,10 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"- For an 'off_topic' reply: lightly acknowledge the aside and pivot back warmly ('Ha, no worries —', " +
 	"'No problem —', 'Right, anyway —'), WITHOUT engaging the tangent and WITHOUT promising to discuss it " +
 	"later. The agent re-asks the question itself right after.\n" +
+	"- For a 'needs_help' reply: reassure them and hint HOW to answer, addressing their specific confusion " +
+	"('No need for a score — just your honest gut feeling.', 'However you'd like to answer is fine — big " +
+	"or small.'). Keep it short and warm; do NOT restate the question (the agent re-poses it right after). " +
+	"Never end with '?'.\n" +
 	"- Leave ack EMPTY (\"\") for 'wants_stop', 'repeat', 'unintelligible', and for any 'unclear' answer " +
 	"(those get their own handling — no lead-in).\n" +
 	"- NEVER invent facts about the product or the respondent. If nothing specific fits, a brief neutral " +
@@ -327,8 +381,8 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 // current question. Runs at temperature 0 so the label is stable/repeatable.
 func (c *Client) ClassifyTurn(ctx context.Context, question, reply string) (Turn, error) {
 	reply = strings.TrimSpace(reply)
-	if reply == "" {
-		return Turn{Intent: IntentUnintellig, Sufficient: false}, nil
+	if reply == "" || IsNonSpeechArtifact(reply) {
+		return Turn{Intent: IntentUnintellig, Sufficient: false, Clarity: ClarityUnclear}, nil
 	}
 	system, msgs := classifyPrompt(question, reply)
 	am := make([]api.Message, 0, len(msgs)+1)

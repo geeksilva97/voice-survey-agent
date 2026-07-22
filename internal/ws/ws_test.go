@@ -80,6 +80,24 @@ func TestFollowUpPrompt(t *testing.T) {
 	}
 }
 
+// TestHelpPrompt: a needs-help turn leads with the classifier's reassurance (or
+// a neutral fallback) and always re-poses the question so the respondent gets a
+// real second shot at answering.
+func TestHelpPrompt(t *testing.T) {
+	q := "How would you rate the quality of our coffee?"
+
+	got := helpPrompt("No need for a score — just your gut feeling.", q)
+	if !strings.HasPrefix(got, "No need for a score") || !strings.Contains(got, q) {
+		t.Errorf("help should lead with the reassurance and re-pose the question; got %q", got)
+	}
+
+	// No ack from the model → neutral reassurance, still re-poses the question.
+	fb := helpPrompt("   ", q)
+	if !strings.Contains(fb, q) || !strings.Contains(fb, "honest take") {
+		t.Errorf("empty-ack fallback should reassure and re-pose the question; got %q", fb)
+	}
+}
+
 // TestIntroLine: the LLM-authored opening wins when present; otherwise a fixed,
 // product-named greeting is used so the first turn always sounds complete.
 func TestIntroLine(t *testing.T) {

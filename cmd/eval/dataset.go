@@ -101,15 +101,25 @@ var dataset = []evalCase{
 	{"What do you think of the app?", "Nah I'm good, I don't want to continue.", llm.IntentWantsStop, na},
 	{"How was your visit?", "Sorry, I have that to go now, my bus is coming.", llm.IntentWantsStop, na}, // calque of "tenho que ir"
 
-	// ---- repeat: didn't hear / didn't understand ----
+	// ---- repeat: didn't HEAR it (audio), wants it read again as-is ----
 	{"What do you think of our scented candles?", "Sorry, what was the question?", llm.IntentRepeat, na},
 	{"How often do you burn candles?", "Can you say that again? I didn't catch it.", llm.IntentRepeat, na},
 	{"What's your favorite scent?", "Huh? Come again?", llm.IntentRepeat, na},
-	{"Would you recommend us?", "Sorry, I don't understand the question.", llm.IntentRepeat, na},
 	{"What feature would you add?", "Wait, could you repeat that please?", llm.IntentRepeat, na},
 	{"How was the service?", "I didn't quite hear you, what did you ask?", llm.IntentRepeat, na},
 	{"What would you improve?", "What? I missed that.", llm.IntentRepeat, na},
 	{"What's your favorite scent?", "Repeat please, I no understand well the question.", llm.IntentRepeat, na}, // ESL grammar
+
+	// ---- needs_help: heard it, but unsure how to answer / asks us to clarify ----
+	// The respondent isn't quitting and hasn't answered — they need guidance. The
+	// agent should reassure + hint how to answer, then re-pose (not just re-read).
+	{"How would you rate the quality of our coffee?", "Do you expect some score or something?", llm.IntentNeedsHelp, na},
+	{"What's one thing you'd improve about our candles?", "Hmm, I'm not really sure what you're looking for here.", llm.IntentNeedsHelp, na},
+	{"How likely are you to recommend us?", "What do you mean exactly?", llm.IntentNeedsHelp, na},
+	{"How would you rate the scent, from one to ten?", "Like a number, or should I just describe it?", llm.IntentNeedsHelp, na},
+	{"What could we improve about the app?", "I'm not sure how to answer that, to be honest.", llm.IntentNeedsHelp, na},
+	{"Would you recommend us?", "Sorry, I don't understand the question.", llm.IntentNeedsHelp, na},
+	{"What did you think of the service?", "Hmm, what kind of thing are you looking for?", llm.IntentNeedsHelp, na},
 
 	// ---- off_topic: genuinely unrelated ----
 	{"What's your favorite scent?", "What time do you close today?", llm.IntentOffTopic, na},
@@ -128,4 +138,9 @@ var dataset = []evalCase{
 	{"What do you think of our candles?", "(buzzing) (buzzing)", llm.IntentUnintellig, na},
 	{"What's your favorite scent?", "uh... mm... [inaudible]", llm.IntentUnintellig, na},
 	{"How often do you shop with us?", "sffft krrr ffff", llm.IntentUnintellig, na},
+	// Parenthesized NON-SPEECH sounds from STT: a real word inside, but not an
+	// answer. The agent must not say "Got it" and advance on a cough.
+	{"How satisfied are you with the quality of our furniture?", "(coughing)", llm.IntentUnintellig, na},
+	{"What could we improve about our candles?", "(clears throat)", llm.IntentUnintellig, na},
+	{"How was the service?", "(laughs)", llm.IntentUnintellig, na},
 }

@@ -280,6 +280,24 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		return cv.askNextOrFinish("")
 	}
 
+	// "Needs help": they heard the question but don't know how to answer it (or
+	// asked us to clarify). Reassure + hint how to answer (the classifier's ack),
+	// then re-pose the SAME question — don't advance, so they get a real second
+	// shot. Shares the re-ask budget so a confused respondent can't loop forever.
+	if turn.Intent == llm.IntentNeedsHelp {
+		if cv.reasks < maxReasks {
+			cv.reasks++
+			idx, total := cv.sv.Progress()
+			msg := helpPrompt(turn.Ack, q.Text)
+			cv.emit(outMsg{Type: "agent_say", Text: msg, Kind: "question", Index: idx, Total: total}, msg)
+			return false
+		}
+		// Still no answer after helping — don't fabricate one; skip honestly.
+		cv.sv.CaptureAndAdvance("")
+		cv.persist()
+		return cv.askNextOrFinish("")
+	}
+
 	// A sufficient, on-topic answer.
 	if turn.Intent == llm.IntentAnswer && turn.Sufficient {
 		// Understood-but-unclear (calque / heavy ESL / ambiguous): confirm ONCE,
@@ -629,4 +647,16 @@ func followUpPrompt(intent llm.Intent, ack, question string) string {
 	default: // a vague but on-topic answer
 		return "Could you tell me a little more about that?"
 	}
+}
+
+// helpPrompt builds the spoken turn when the respondent needs help answering.
+// The classifier's ack carries a warm, question-specific reassurance/hint; we
+// lead with it and re-pose the question so they always hear the question again.
+// If the model gave no ack (weaker models under-produce), a neutral reassurance
+// keeps the turn helpful rather than a bare re-read.
+func helpPrompt(ack, question string) string {
+	if lead := strings.TrimSpace(ack); lead != "" {
+		return lead + " " + question
+	}
+	return "However you'd like to answer is totally fine — just your honest take. " + question
 }
