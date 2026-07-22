@@ -29,6 +29,7 @@ func main() {
 	classifyModel := flag.String("classify-model", "", "model for per-turn classification; Ollama or an Anthropic model like claude-sonnet-5 (default: -model). The repair turn fires more on stronger models.")
 	insightModel := flag.String("insight-model", "qwen2.5:3b", "model for the results-insight scoring pass; Ollama (offline) or an Anthropic model like claude-sonnet-5")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
+	navigation := flag.Bool("navigation", true, "let respondents jump back to re-answer an earlier question (meta navigation)")
 	flag.Parse()
 
 	log.Println("loading speech models (Kokoro TTS + Whisper STT)…")
@@ -89,7 +90,12 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer}
+	// Meta-navigation reuses the classify-model completer (the conversation brain).
+	var navLLM llm.Completer
+	if *navigation {
+		navLLM = closer
+	}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Nav: navLLM}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))

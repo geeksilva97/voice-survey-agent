@@ -26,6 +26,47 @@ func TestHappyPathCompletes(t *testing.T) {
 	}
 }
 
+// TestRevisitReopensAndResumes covers the meta-navigation case: on Q3, jump back
+// to Q1 (which had been skipped), answer it, and confirm the survey re-opens that
+// slot, records the new answer, and still completes once nothing remains.
+func TestRevisitReopensAndResumes(t *testing.T) {
+	s := New([]string{"Q1", "Q2", "Q3"})
+	s.MarkAsked()
+	s.CaptureAndAdvance("") // Q1 skipped (they coughed)
+	s.MarkAsked()
+	s.RecordAnswer("answer 2") // Q2 answered → now on Q3
+	if cur, _ := s.Current(); cur.Text != "Q3" {
+		t.Fatalf("expected to be on Q3, got %q", cur.Text)
+	}
+
+	if !s.Revisit(0) {
+		t.Fatal("Revisit(0) should succeed")
+	}
+	cur, ok := s.Current()
+	if !ok || cur.Text != "Q1" || cur.Status != Asked {
+		t.Fatalf("after Revisit expected Q1 re-opened (Asked), got %+v", cur)
+	}
+	if done, _ := s.Done(); done {
+		t.Fatal("survey must not be done — Q1 and Q3 still need answers")
+	}
+	s.RecordAnswer("answer 1 finally") // advances forward from Q1; Q2 answered → Q3
+	if cur, _ := s.Current(); cur.Text != "Q3" {
+		t.Fatalf("expected to resume at Q3, got %q", cur.Text)
+	}
+	s.RecordAnswer("answer 3")
+	if done, reason := s.Done(); !done || reason != Completed {
+		t.Fatalf("expected completed, got done=%v reason=%q", done, reason)
+	}
+	if s.Questions[0].Answer != "answer 1 finally" {
+		t.Fatalf("Q1 should hold the re-answer, got %q", s.Questions[0].Answer)
+	}
+
+	// Out-of-range revisit is a no-op failure.
+	if s.Revisit(9) || s.Revisit(-1) {
+		t.Fatal("out-of-range Revisit should return false")
+	}
+}
+
 func TestFollowUpCapThenAdvance(t *testing.T) {
 	s := New([]string{"Q1", "Q2"})
 	// First question: one follow-up allowed, then must advance on capture.

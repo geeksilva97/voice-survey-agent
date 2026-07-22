@@ -119,3 +119,25 @@ func TestIsNonSpeechArtifact(t *testing.T) {
 		}
 	}
 }
+
+// TestParseNav locks the tolerant parse of the navigation resolver's JSON:
+// numbers or quoted numbers, stray text, and unparseable → not-navigation.
+func TestParseNav(t *testing.T) {
+	cases := []struct {
+		raw      string
+		wantNav  bool
+		wantTgt  int
+	}{
+		{`{"is_nav": true, "target": 1}`, true, 1},
+		{`sure: {"is_nav":true,"target":"3"} ok`, true, 3},
+		{`{"is_nav": false, "target": 0}`, false, 0},
+		{`garbage`, false, 0},
+		{`{"is_nav": true}`, true, 0},
+	}
+	for _, c := range cases {
+		got := parseNav(c.raw)
+		if got.IsNav != c.wantNav || got.Target != c.wantTgt {
+			t.Errorf("parseNav(%q) = %+v, want {IsNav:%v Target:%d}", c.raw, got, c.wantNav, c.wantTgt)
+		}
+	}
+}

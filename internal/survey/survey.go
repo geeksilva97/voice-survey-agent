@@ -129,6 +129,24 @@ func (s *Survey) TryFillOther(match func(question string) (answer string, ok boo
 	return filled
 }
 
+// Revisit moves the cursor back to an earlier question so the respondent can
+// (re)answer it — the "meta navigation" case ("can we go back to the first
+// one?"). It re-opens the slot (status back to Asked, clearing any prior answer)
+// so it's asked again and the next reply is recorded against it. After they
+// answer, the normal advance() resumes filling whatever slots still remain, so
+// order-of-answering doesn't affect when the survey is Done. Returns false for
+// an out-of-range index (caller should not navigate).
+func (s *Survey) Revisit(index int) bool {
+	if index < 0 || index >= len(s.Questions) {
+		return false
+	}
+	s.idx = index
+	s.followUps = 0
+	s.Questions[index].Status = Asked
+	s.Questions[index].Answer = ""
+	return true
+}
+
 // Bail terminates the survey early because the respondent wants to stop.
 func (s *Survey) Bail() { s.end = Bailed }
 

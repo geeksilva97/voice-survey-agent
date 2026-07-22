@@ -55,6 +55,10 @@ type Handler struct {
 	Speech *speech.Engine
 	LLM    llm.Classifier
 	Closer llm.Completer
+	// Nav resolves meta-navigation ("go back to the first question") against the
+	// survey state. Optional: nil disables the layer (replies are only ever
+	// treated as answers). Reuses the classify-model completer.
+	Nav llm.Completer
 }
 
 // outMsg is a server->client control frame.
@@ -222,6 +226,13 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 	q, ok := cv.sv.Current()
 	if !ok {
 		return cv.finishCompleted("")
+	}
+
+	// Meta navigation ("can we go back to the first question?"). A cheap keyword
+	// gate first, so normal answers never pay for the extra model call; the
+	// resolver is authoritative and fails safe to "not navigation".
+	if cv.h.Nav != nil && looksLikeNavigation(text) && cv.tryNavigate(text) {
+		return false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -447,6 +458,65 @@ func introLine(intro, product string) string {
 		return s
 	}
 	return "Hi! A few quick questions about " + product + ". There are no wrong answers. Here's the first:"
+}
+
+// navCues are loose keyword triggers for the meta-navigation resolver. They only
+// gate WHETHER to call the resolver (which is authoritative), so being generous
+// here costs at most an extra model call on a false positive — never a wrong
+// action. Kept specific enough that ordinary answers don't trip them.
+var navCues = []string{
+	"go back", "back to the", "come back to", "return to", "go to the",
+	"previous question", "last question", "earlier question", "question before",
+	"first question", "second question", "third question", "fourth question", "fifth question",
+	"change my answer", "change the answer", "answer again", "re-answer", "reanswer",
+	"redo", "the one i skipped", "the one about", "start over",
+}
+
+// looksLikeNavigation is the cheap pre-gate before the resolver call.
+func looksLikeNavigation(text string) bool {
+	t := strings.ToLower(text)
+	for _, c := range navCues {
+		if strings.Contains(t, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// tryNavigate asks the resolver (which sees the whole question list + current
+// position) whether the reply is a jump-to-another-question request, and if so
+// re-opens that slot and asks it. Returns true when it navigated. Fails safe:
+// any error, non-nav verdict, or out-of-range target leaves the survey untouched
+// so the reply falls through to normal answer handling.
+func (cv *conversation) tryNavigate(text string) bool {
+	cur, _ := cv.sv.Progress() // 1-based index of the current question
+	qs := make([]llm.NavQuestion, len(cv.sv.Questions))
+	for i, q := range cv.sv.Questions {
+		qs[i] = llm.NavQuestion{Text: q.Text, Status: string(q.Status), Current: i == cur-1}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := llm.ResolveNavigation(ctx, cv.h.Nav, text, qs)
+	if err != nil {
+		log.Printf("nav resolve error: %v", err)
+		return false
+	}
+	if !res.IsNav || res.Target < 1 || res.Target > len(cv.sv.Questions) {
+		return false
+	}
+	if !cv.sv.Revisit(res.Target - 1) {
+		return false
+	}
+	// New question context — reset the per-question counters/repair state.
+	cv.reasks = 0
+	cv.confirmed = false
+	cv.awaitingConfirm = false
+	q, _ := cv.sv.Current()
+	idx, total := cv.sv.Progress()
+	msg := "Of course — let's go back to that one. " + q.Text
+	cv.emit(outMsg{Type: "agent_say", Text: msg, Kind: "question", Index: idx, Total: total}, msg)
+	cv.persist()
+	return true
 }
 
 // withLead prepends a spoken acknowledgment to the next line, if present.
