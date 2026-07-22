@@ -98,6 +98,34 @@ func TestHelpPrompt(t *testing.T) {
 	}
 }
 
+// TestLooksLikeNavigation: the cheap pre-gate trips on jump-to-question phrasing
+// and stays quiet for ordinary answers (so normal replies cost no resolver call).
+func TestLooksLikeNavigation(t *testing.T) {
+	nav := []string{
+		"can we go back to the first question?",
+		"I want to change my answer",
+		"actually, go to the second question",
+		"let me answer the one I skipped",
+		"can you redo that earlier question",
+	}
+	for _, s := range nav {
+		if !looksLikeNavigation(s) {
+			t.Errorf("looksLikeNavigation(%q) = false, want true", s)
+		}
+	}
+	answers := []string{
+		"I really like the lavender one, it's relaxing",
+		"maybe three times a week",
+		"the scent could last longer",
+		"nothing comes to mind, honestly",
+	}
+	for _, s := range answers {
+		if looksLikeNavigation(s) {
+			t.Errorf("looksLikeNavigation(%q) = true, want false", s)
+		}
+	}
+}
+
 // TestIntroLine: the LLM-authored opening wins when present; otherwise a fixed,
 // product-named greeting is used so the first turn always sounds complete.
 func TestIntroLine(t *testing.T) {

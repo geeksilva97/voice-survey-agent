@@ -174,6 +174,36 @@ advances). Model-independent — it holds even on the local 3B, which the prompt
 rule alone did not. Unit tested (`TestIsNonSpeechArtifact`); dataset covers
 `(coughing)`, `(clears throat)`, `(laughs)`.
 
+### Meta navigation (go back and re-answer an earlier question)
+
+A **top layer over the survey state**, separate from per-turn classification: the
+respondent can jump to a different question to (re)answer it — *"can we go back to
+the first question?"*, *"I want to redo question two"*, *"let me answer the one I
+skipped"*. This is what lets someone fix a slot they coughed through three
+questions ago.
+
+How it works, per reply, before it's treated as an answer:
+1. a cheap keyword pre-gate (`looksLikeNavigation`) — so ordinary answers cost no
+   extra model call;
+2. if it trips, `llm.ResolveNavigation` (reusing the classify-model completer)
+   sees the **whole question list with statuses + the current position** and
+   returns `{is_nav, target}`. It's authoritative and **fails safe to
+   not-navigation** (a normal answer is never treated as navigation);
+3. on a valid target, `survey.Revisit(index)` re-opens that slot (status back to
+   `Asked`, clears the old answer) and the agent re-asks it. After they answer,
+   the normal `advance()` resumes filling whatever slots remain, so completion is
+   order-independent.
+
+Kept out of the gated per-turn classifier on purpose (so it can't destabilize
+that prompt) and given the full survey context it needs. Toggle with
+`-navigation` (default on; nil completer also disables it). Unit tested:
+`survey.Revisit` (`TestRevisitReopensAndResumes`), `looksLikeNavigation`
+(`TestLooksLikeNavigation`), resolver parse (`TestParseNav`). Browser QA
+(2026-07-22, sonnet, poll `8b3a2269c4`): on Q2 the respondent asked to go back to
+Q1, the agent said *"Of course — let's go back to that one."* and re-asked Q1,
+recorded the new answer (replacing the original), resumed at Q2, and finished
+`completed`. QA clip: `goback.wav`.
+
 ### Acknowledgment layer (making it feel like a conversation, not a form)
 
 Every turn, the classifier also returns a short **`ack`** — a warm, specific

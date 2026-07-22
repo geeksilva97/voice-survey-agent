@@ -40,6 +40,9 @@ func main() {
 		// the agent for guidance. Should classify needs_help so the agent reassures
 		// + hints how to answer, then re-poses the question (needs-help layer QA).
 		"unsure.wav": "Hmm, I'm not really sure how to answer that. What are you looking for?",
+		// A meta-navigation request — asks to jump back to an earlier question to
+		// re-answer it. Should trigger the navigation layer (revisit + re-ask).
+		"goback.wav": "Actually, wait — can we go back to the very first question? I'd like to answer that one again.",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)
