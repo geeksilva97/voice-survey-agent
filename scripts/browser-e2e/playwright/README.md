@@ -52,6 +52,28 @@ here or on the command line.
 (end_reason, slots, intents, spoken turns, transcript) plus a Playwright trace, so
 a failure is diagnosable without re-running.
 
+## Recording a demo video (`demo-record.js`)
+
+Runs one persona through the real voice page and produces a shareable MP4 —
+screen video plus **the agent's voice**. (Half-voices: the persona's answers are
+played into the fake mic, not the speakers, so only the agent is audible; the
+on-screen transcript shows both sides.) It captures audio without any OS loopback
+device by tapping the page's Web Audio output (`ctx.destination`) into a
+`MediaStreamDestination` recorded via `MediaRecorder`, while Playwright records the
+silent screen video; `ffmpeg` then muxes the two.
+
+```bash
+node demo-record.js                     # enthusiast, against :8090
+QA_PERSONA=rusher node demo-record.js   # or confused / neutral
+QA_PERSONA=silent node demo-record.js   # respondent never speaks -> silence-backstop ending
+QA_BASE=http://localhost:8091 node demo-record.js
+```
+
+Output lands in `demo-out/` (gitignored). Needs the server running with `-qa`
+(default `:8090`) and `ffmpeg` on `PATH`. `silent` mode injects a fake mic that
+only emits silence, so VAD never fires and the server's silence backstop ends the
+call — a clean demo of Ava detecting the respondent is gone and wrapping up.
+
 ## Relationship to the Chrome MCP flow
 
 Both use the identical harness (`../persona-answerer.js`) and the same `-qa`
