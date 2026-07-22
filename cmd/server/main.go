@@ -27,7 +27,7 @@ func main() {
 	webDir := flag.String("web", "web", "directory with static frontend files")
 	ollamaModel := flag.String("model", "qwen2.5:3b", "Ollama model for question generation")
 	classifyModel := flag.String("classify-model", "", "model for per-turn classification; Ollama or an Anthropic model like claude-sonnet-5 (default: -model). The repair turn fires more on stronger models.")
-	insightModel := flag.String("insight-model", "qwen2.5:3b", "model for the results-insight scoring pass; Ollama (offline) or an Anthropic model like claude-sonnet-5")
+	insightModel := flag.String("insight-model", "gemma4:latest", "model for the results-insight scoring pass; Ollama (offline) or an Anthropic model like claude-sonnet-5")
 	greeting := flag.Bool("greeting", true, "open each session with a short 'how's your day' greeting before the survey")
 	agentName := flag.String("agent-name", "Ava", "the voice agent's name (used in the spoken greetings)")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")

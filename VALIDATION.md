@@ -144,41 +144,71 @@ Anthropic models read the key from `$ANTHROPIC_API_KEY`, else `-anthropic-env`
 (defaults to pepita's `.env`). Ollama/`:cloud` models need no key. Every turn
 now costs a round-trip to that model, so expect a little more latency per reply.
 
-### Greeting pre-layer (a named agent says hello like a person)
+### Greeting pre-layer (a named agent eases in like a person)
 
-Sessions open with a small-talk hello before any question, so the agent greets
-like a person, not a form. The agent has a **name** (default **Ava**, set with
-`-agent-name`) and introduces herself, says she'll ask a few quick questions
-about the product, and asks how the person's day is going — e.g. *"Hi, I'm Ava!
-I've got a few quick questions about your candles — but first, how's your day
-going?"*
+Sessions open the way a person eases into a call — **hello, listen, then get to
+business** — as three beats, not one:
 
-Greetings **vary**: `greetingLine` picks from a set of curated templates at
-random per session (name + product filled in), so the opener differs across
-sessions with zero runtime latency. These are hand-written rather than
-LLM-generated on purpose — the offline question-gen model (3B) proved too weak to
-self-introduce reliably (it addressed the *respondent* by the agent's name), so
-templates keep the signature hello correct regardless of model. Unit tested
-(`TestGreetingLine`). (A stronger question-gen model could generate greetings per
-poll later; templates are the reliable default.)
+1. **Hello only.** A short, time-of-day-aware greeting with the agent's name
+   (default **Ava**, `-agent-name`) and a "how are you" — and *nothing else*. No
+   agenda, no product up front: *"Good afternoon! My name's Ava. How's your day
+   treating you?"* `greetingLine` picks from curated templates at random (name +
+   `timeOfDay` filled in), so the opener varies with zero latency. Templates are
+   hand-written on purpose — the offline 3B was too weak to self-introduce
+   reliably. Unit tested (`TestGreetingLine`, `TestTimeOfDay`).
 
-The reply is read with the **existing** turn classifier (one call, no new prompt,
-no extra latency): a bail ends the session gracefully; otherwise the classifier's
-`ack` becomes a warm, specific caring line (*"Glad to hear — busy but good."*)
-that leads into the survey (caring line + a light "no wrong answers" bridge + Q1,
-one clip — the greeting already named the product, so no second hello or product
-restatement). `surveyOpening` is unit tested (`TestSurveyOpening`).
+2. **Reply + framing + consent.** The small-talk reply is first run through the
+   turn classifier once (catch an early bail). If they didn't bail, Ava's spoken
+   reply is **LLM-authored** by the Closer completer (`composeGreetingLead` →
+   `greetingReplySystem`) so she genuinely engages: reacts to what they actually
+   said (reciprocates *"how about you?"*, notices a busy day), then in ONE tight
+   line — single transition, capped ~35 words to avoid a wall of text — frames the
+   survey with the **question count and purpose**, and **ends by asking if they're
+   ready** (*"...three questions about your candles, to see what's landing —
+   sound good?"*). She stops there and waits; she does NOT ask the first question
+   yet. A deterministic `fixedFraming` fallback mirrors this (count + product +
+   purpose + "Sound good?") when no completer is wired or the model misbehaves.
+   Both the prompt and fallback are unit tested (`TestGreetingReplySystem`,
+   `TestFixedFraming`, `sanitizeSpoken` via `TestSanitizeSpoken`).
 
-It's a SINGLE exchange — never loops, so the survey starts promptly. Silence or a
-cough during the greeting falls through the normal silence backstop / non-speech
-guard. Caring-line quality tracks model strength (like acks): on the 3B the ack
-may be empty, so it opens with a neutral-warm fallback. Toggle the whole layer
-with `-greeting` (default on); off restores the LLM-authored intro opening.
+3. **Go-ahead → first question.** The reply to "ready?" is read by `handleStart`:
+   a bail ends the call gracefully; anything else is the go-ahead, and the survey
+   opens with a brief warm lead + Q1.
+
+Each of beats 2 and 3 is a SINGLE exchange — never loops, so the survey starts
+promptly. Silence or a cough during the greeting falls through the normal silence
+backstop / non-speech guard. LLM-authored quality tracks model strength; on a
+weak local model the fixed framing/fallbacks keep it correct. Toggle the whole
+layer with `-greeting` (default on); off restores the LLM-authored intro opening.
 
 ```bash
 go run ./cmd/server                        # greeting on (default), agent "Ava"
 go run ./cmd/server -agent-name=Nova       # rename the agent
 go run ./cmd/server -greeting=false        # straight into the intro + first question
+```
+
+### Survey purpose (steers questions AND the spoken framing)
+
+The setup page has an optional **"What's this survey for?"** field. The purpose is
+threaded through `createPoll → Store.Create → Poll.Purpose` and used in two
+places:
+
+- **Question generation** — `GenerateSurvey(product, purpose)` feeds the goal into
+  the prompt, which *requires* the questions to focus on it. So "new dishes from
+  the northeast region" yields questions about those dishes, not generic
+  restaurant filler.
+- **Spoken framing** — Ava states the goal (compressed) in the consent beat above.
+
+The setup **presets are scenario-based** (Launching a product, Testing a feature,
+New menu, Customer satisfaction, Churn / cancellation, Post-event feedback); each
+chip fills both the product and a matching purpose so the generated survey targets
+the real use case. Verify by creating a poll with a purpose and inspecting the
+stored questions:
+
+```bash
+curl -s localhost:8090/api/polls -H 'content-type: application/json' \
+  -d '{"product":"a Brazilian restaurant","purpose":"opinions on new northeast-region dishes"}' \
+  | python3 -m json.tool   # questions should center on the new dishes
 ```
 
 ### "Needs help" — when the respondent doesn't know how to answer
@@ -289,9 +319,9 @@ LLM call (`internal/insight`, via `llm.NewCompleter` — NOT the per-turn
 classifier). Given the product + the transcript (question/answer/status per
 slot) it returns product **sentiment**, per-answer **usefulness** (1–5) and
 **confidence** (1–5), a short **summary**, and an aggregate. Scoring model is
-`-insight-model` (default local `qwen2.5:3b`, offline). Results are cached on the
-poll (`?refresh=1` recomputes). Reachable from `/results/<id>` via "View scored
-insights".
+`-insight-model` (default local `gemma4:latest`, offline). Results are cached on
+the poll (`?refresh=1` recomputes). Reachable from `/results/<id>` via "View
+scored insights".
 
 ```bash
 go run ./cmd/server                       # then open /insights/<a completed poll id>
@@ -395,6 +425,17 @@ go run ./cmd/server -classify-model claude-sonnet-5
   - `claude-sonnet-5` (poll `8fc80b827a`) — *"Ha, no worries —"* redirect, then a
     specific ack every turn with varied phrasing (*"…got it."*, *"…love it."*,
     *"…noted."*).
+- **Human opening (hello → reply → consent) + purpose-driven questions**
+  (2026-07-22, browser QA, `-classify-model claude-sonnet-5
+  -insight-model gemma4:latest`): opener is a time-aware hello only; the reply
+  reciprocates and frames the survey with count + purpose in one tight line
+  ending *"…sound good?"*, then waits; the go-ahead opens Q1. A "Churn /
+  cancellation" preset produced cancellation-focused questions (purpose steered
+  generation, confirmed against the stored poll). Iterated live to remove a
+  wall-of-text run-on and an abrupt double transition. Unit suite green
+  (`go test ./...`); greeting/framing helpers covered by `TestGreetingLine`,
+  `TestTimeOfDay`, `TestGreetingReplySystem`, `TestFixedFraming`,
+  `TestSanitizeSpoken`.
 - **Opening intro + personalized closing — per classify/closer model**
   (2026-07-21, candles, happy path `['ans0','ans1','ans2']`, all
   `end_reason=completed`). Intro is authored by the question-gen model (always
