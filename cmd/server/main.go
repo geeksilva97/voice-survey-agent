@@ -15,6 +15,7 @@ import (
 
 	"voicesurvey/internal/insight"
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/qa"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
 	"voicesurvey/internal/ws"
@@ -31,6 +32,7 @@ func main() {
 	greeting := flag.Bool("greeting", true, "open each session with a short 'how's your day' greeting before the survey")
 	agentName := flag.String("agent-name", "Ava", "the voice agent's name (used in the spoken greetings)")
 	pacing := flag.Bool("pacing", true, "deliver each question as two beats — a short acknowledgment, a brief pause, then the question — instead of one breath")
+	qaFlag := flag.Bool("qa", false, "mount the DEV-ONLY persona QA endpoint (POST /api/qa/reply) for browser E2E testing; never enable in production")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
 	flag.Parse()
 
@@ -105,6 +107,14 @@ func main() {
 	mux.HandleFunc("GET /ws", wsHandler.Serve)
 	staticFS := http.FileServer(http.Dir(filepath.Join(*webDir, "static")))
 	mux.Handle("GET /static/", http.StripPrefix("/static/", noCache(staticFS)))
+
+	// Dev-only: the persona QA endpoint that generates a simulated respondent's
+	// spoken answer on demand (LLM in-character -> TTS in the persona's voice) for
+	// browser end-to-end testing. Never mounted in production.
+	if *qaFlag {
+		mux.HandleFunc("POST /api/qa/reply", qaReply(closer, eng))
+		log.Printf("QA persona endpoint ENABLED at POST /api/qa/reply (personas: %s)", qa.PersonaIDs())
+	}
 
 	log.Printf("voice-survey PoC listening on http://localhost%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
@@ -212,4 +222,46 @@ func (a *app) getInsights(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// qaReply is the DEV-ONLY persona endpoint used by the browser E2E harness. It
+// generates a simulated respondent's next spoken turn in character (LLM) and
+// returns it as synthesized audio in the persona's voice — which the harness
+// plays into the fake microphone, so the answer then flows back through the real
+// VAD -> STT -> classifier path. The generated text is echoed in X-QA-Text for
+// logging. It reuses the classify-model completer, so nothing extra is wired.
+func qaReply(gen llm.Completer, eng *speech.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Persona  string `json:"persona"`
+			Question string `json:"question"`
+			Answered int    `json:"answered"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		p, ok := qa.Find(req.Persona)
+		if !ok {
+			http.Error(w, "unknown persona", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		text, err := gen.Complete(ctx, p.System, qa.ReplyUser(req.Question, req.Answered))
+		if err != nil {
+			http.Error(w, "generation failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		text = strings.TrimSpace(strings.Trim(strings.TrimSpace(text), `"`))
+		wav, err := eng.SynthesizeVoice(text, p.VoiceID)
+		if err != nil {
+			http.Error(w, "tts failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("X-QA-Text", strings.ReplaceAll(text, "\n", " "))
+		w.Header().Set("Access-Control-Expose-Headers", "X-QA-Text")
+		_, _ = w.Write(wav)
+	}
 }
