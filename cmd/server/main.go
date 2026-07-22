@@ -94,7 +94,7 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Greeting: *greeting, AgentName: *agentName, Pacing: *pacing}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Greeting: *greeting, AgentName: *agentName, Pacing: *pacing, QA: *qaFlag}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))

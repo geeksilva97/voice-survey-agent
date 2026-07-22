@@ -153,13 +153,79 @@ fresh reply. A running log is exposed at `window.__qa.turns`.
    `window.__qa.turns`.
 6. Confirm ground truth from `data/<id>.json` (`end_reason`, per-slot `status`).
 
-One run at a time, one persona each — repeat for the set. (This is agent-driven;
-a standing headless runner, e.g. Playwright, would be the next step if we want CI.)
+One run at a time, one persona each — repeat for the set. This is **agent-driven**:
+good for interactive, exploratory QA where a human watches and reacts. For the
+**repeatable, one-command** version, see the Playwright suite below.
 
 Timing note: an LLM generation (~2-3s) plus TTS plus playback is well under the
 server's 12s silence backstop, so the deliberate think-time never trips a
 reprompt. Enthusiast runs are the slowest simply because the answers are long to
 synthesize and play.
+
+---
+
+## Running it (Playwright — headless, one command, CI)
+
+The Chrome MCP flow is great for watching a run and reacting, but it's manual and
+one persona at a time. The **Playwright suite** (`scripts/browser-e2e/playwright/`)
+is the same thing made repeatable: it builds the server, launches it with `-qa` on
+a dedicated port (default **8091**, so it never touches a dev server on :8090),
+runs all four personas end-to-end, asserts outcomes, and tears the server down.
+
+```bash
+cd scripts/browser-e2e/playwright
+npm install && npm run setup   # once: deps + the Chromium build Playwright drives
+npm test                       # all four personas, headless, with assertions
+```
+
+It reuses the **exact same harness** — `persona-answerer.js` is injected verbatim
+via `page.addInitScript`, with `window.__persona` set first. Nothing about the
+pipeline changes; only the *driver* differs (a headless test runner instead of me
+over MCP).
+
+**How Playwright handles the mic.** Two levels, both used:
+
+- **Permission** — granted up front with `permissions: ['microphone']` on the
+  context, so there's no dialog. (Chromium is also launched with
+  `--use-fake-ui-for-media-stream --use-fake-device-for-media-stream` and
+  `--autoplay-policy=no-user-gesture-required` so `getUserMedia` is allowed and
+  Web Audio isn't autoplay-blocked in headless.)
+- **The audio itself** — still the `getUserMedia` override from
+  `persona-answerer.js`. Chromium *can* also feed a fixed WAV file as the fake mic
+  (`--use-file-for-fake-audio-capture=file.wav`), but that file is fixed at launch,
+  which is no good for our on-demand, per-turn persona answers — so we keep the
+  override, which plays each freshly-synthesized answer into a
+  `MediaStreamDestination`.
+
+**Assertions are on outcomes**, from two sources:
+
+- **Ground truth** — `end_reason` and per-slot `status`, read back from
+  `GET /api/polls/<id>` (authoritative; the state machine, not a string, decides).
+- **Real classifier intents** — in `-qa` mode the server mirrors each per-turn
+  classifier decision to the client as a `{"type":"qa_intent", ...}` frame
+  (collected in `window.__qaIntents`). This lets a test assert that `wants_stop`
+  actually fired for the rusher, or `needs_help` for the confused persona, rather
+  than eyeballing the transcript. The channel is **dev-only** — it's emitted only
+  when the server runs with `-qa` and is inert in production (the production client
+  simply records it and moves on).
+
+| Persona | Asserted outcome |
+|---------|------------------|
+| **enthusiast** | `completed`; every slot `answered` |
+| **neutral** | `completed`; every slot `answered`; `needs_help` never fires |
+| **rusher** | `bailed`; `wants_stop` fired; ≥1 answered, ≥1 left unanswered |
+| **confused** | `completed`; `needs_help` fired ≥1×; every slot terminal |
+
+The persona definitions (`internal/qa/personas.go`) are the source of truth for
+expected behavior; the suite's `personas.spec.js` mirrors them. On failure,
+`npm run report` opens an HTML report where each test attaches an `outcome.json`
+(end_reason, slots, intents, spoken turns, transcript) plus a trace. Full runner
+docs: `scripts/browser-e2e/playwright/README.md`.
+
+Model note: the suite defaults its classifier to `claude-sonnet-5` (the
+rusher/confused outcomes depend on accurate intent detection); set
+`QA_CLASSIFY_MODEL=qwen2.5:3b` to run fully offline at lower fidelity. The
+Anthropic key is loaded server-side and never appears in the suite.
 
 ---
 

@@ -403,6 +403,32 @@ Built-in personas and what each asserts (`internal/qa/personas.go`):
 
 `internal/qa` is unit tested (`TestFind`, `TestReplyUser`, `TestPersonaIDs`).
 
+### Persona QA as a one-command suite (Playwright)
+
+The persona QA above is agent-driven (I run it over Chrome DevTools MCP, one
+persona at a time) — good for exploratory checks. The same harness also runs as a
+**headless, assertion-backed regression suite** in `scripts/browser-e2e/playwright/`:
+
+```bash
+cd scripts/browser-e2e/playwright
+npm install && npm run setup   # once
+npm test                       # builds server (-qa on :8091), runs all 4 personas, asserts
+```
+
+It injects the identical `persona-answerer.js` and asserts on **outcomes**:
+`end_reason` + slot statuses (from `GET /api/polls/<id>`) and the **real
+classifier intents**. In `-qa` mode the server mirrors each per-turn decision to
+the client as a `{"type":"qa_intent"}` frame (collected in `window.__qaIntents`),
+so a test can assert `wants_stop` fired for the rusher and `needs_help` for the
+confused persona — not just scrape the transcript. That channel is dev-only (gated
+on `-qa`, `Handler.QA`) and inert in production. Runner docs:
+`scripts/browser-e2e/playwright/README.md`; technique: `docs/BROWSER-QA.md`.
+
+Last suite run (2026-07-22, `-qa` on :8091, `claude-sonnet-5`, candles): **4/4
+passed** (8.9m). Enthusiast `completed` all slots; neutral `completed`, no
+`needs_help` misfire; rusher `bailed` with `wants_stop` fired; confused
+`needs_help` fired → re-pose → `completed`, all slots terminal.
+
 ### Prep (once)
 
 ```bash
