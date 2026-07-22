@@ -150,6 +150,13 @@ function connect() {
         heard.textContent = m.text ? `“${m.text}”` : "(didn't catch that)";
         appendLine("you", m.text);
         break;
+      case "qa_intent":
+        // DEV/TEST ONLY: the server (running with -qa) mirrors each per-turn
+        // classifier decision here so the browser E2E harness can assert on the
+        // real intents that fired. Never sent in production, so this stays inert.
+        (window.__qaIntents || (window.__qaIntents = [])).push(
+          { phase: m.kind, intent: m.intent, clarity: m.clarity, sufficient: !!m.sufficient });
+        break;
       case "cancel":
         stopPlayback(); audioQueue = [];
         break;

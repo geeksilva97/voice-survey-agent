@@ -1,0 +1,17 @@
+{
+  "name": "voice-survey-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Headless browser E2E persona QA for the voice-survey PoC (Playwright). Reuses the same fake-mic harness as the Chrome DevTools MCP flow.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:enthusiast": "playwright test -g enthusiast",
+    "test:rusher": "playwright test -g rusher",
+    "report": "playwright show-report",
+    "setup": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}

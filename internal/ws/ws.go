@@ -67,6 +67,11 @@ type Handler struct {
 	// pause, then the question — instead of one breath, so the agent connects to
 	// the next question like a person. Off restores single-utterance delivery.
 	Pacing bool
+	// QA mirrors each per-turn classifier decision to the client as a
+	// {"type":"qa_intent"} frame so the browser E2E harness can assert on the
+	// real intents that fired (needs_help, wants_stop, …) instead of scraping the
+	// transcript. DEV/TEST ONLY — set from the server's -qa flag; never in prod.
+	QA bool
 }
 
 // outMsg is a server->client control frame.
@@ -77,6 +82,12 @@ type outMsg struct {
 	Index  int    `json:"index,omitempty"`
 	Total  int    `json:"total,omitempty"`
 	Reason string `json:"reason,omitempty"`
+	// QA-only (type "qa_intent"): the classifier's decision for the turn just
+	// processed. Emitted only when the handler runs with QA=true so the browser
+	// E2E harness can assert on real intents. Ignored by the production client.
+	Intent     string `json:"intent,omitempty"`
+	Clarity    string `json:"clarity,omitempty"`
+	Sufficient bool   `json:"sufficient,omitempty"`
 }
 
 // event is something the read loop observed.
@@ -260,6 +271,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		log.Printf("classify error: %v", err)
 		turn = llm.Turn{Intent: llm.IntentAnswer, Sufficient: true, Clarity: llm.ClarityClear} // keep moving
 	}
+	cv.qaSignal("survey", turn)
 
 	// Resolving a repair: the previous agent turn asked "did I get that right?".
 	// This reply is the confirmation/correction. Fail-open: capture and advance,
@@ -577,6 +589,7 @@ func (cv *conversation) handleGreeting(text string) bool {
 		log.Printf("greeting classify error: %v", err)
 		turn = llm.Turn{Intent: llm.IntentAnswer}
 	}
+	cv.qaSignal("greeting", turn)
 
 	// They can bail right at hello ("actually I don't have time").
 	if turn.Intent == llm.IntentWantsStop {
@@ -660,6 +673,7 @@ func (cv *conversation) handleStart(text string) bool {
 		log.Printf("start classify error: %v", err)
 		turn = llm.Turn{Intent: llm.IntentAnswer}
 	}
+	cv.qaSignal("start", turn)
 	if turn.Intent == llm.IntentWantsStop {
 		cv.sv.Bail()
 		cv.persist()
@@ -919,6 +933,25 @@ func (cv *conversation) send(msg outMsg) {
 	if err := cv.c.WriteJSON(msg); err != nil {
 		log.Printf("write error: %v", err)
 	}
+}
+
+// qaSignal mirrors a per-turn classifier decision to the client, but ONLY in QA
+// mode (-qa). The browser E2E harness collects these ("qa_intent" frames) so
+// persona tests can assert on the intents that actually fired — needs_help,
+// wants_stop, and so on — rather than eyeballing the transcript. `phase` marks
+// where in the flow the turn was classified ("greeting", "start", "survey").
+// Never emitted in production, where cv.h.QA is false.
+func (cv *conversation) qaSignal(phase string, turn llm.Turn) {
+	if !cv.h.QA {
+		return
+	}
+	cv.send(outMsg{
+		Type:       "qa_intent",
+		Kind:       phase,
+		Intent:     string(turn.Intent),
+		Clarity:    string(turn.Clarity),
+		Sufficient: turn.Sufficient,
+	})
 }
 
 func (cv *conversation) finalize(reason survey.EndReason) {
