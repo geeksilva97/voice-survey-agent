@@ -134,6 +134,14 @@ function connect() {
         appendLine("agent", m.text);
         setState("speaking", speakStatus(m.kind));
         break;
+      case "agent_add":
+        // A SECOND beat within the same turn (paced ack -> pause -> question):
+        // append its bubble + update caption/progress, but DON'T reset the queue
+        // or re-arm the mic — the turn ends only at the single trailing tts_end.
+        caption.textContent = m.text;
+        if (m.total) { progress.textContent = `${m.index} / ${m.total}`; barfill.style.width = (100 * m.index / m.total) + "%"; }
+        appendLine("agent", m.text);
+        break;
       case "tts_end":
         ttsEnded = true;
         if (!playing && audioQueue.length === 0) onPlaybackDone();

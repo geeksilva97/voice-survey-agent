@@ -63,6 +63,10 @@ type Handler struct {
 	// AgentName is the voice agent's name, used in the fixed fallback greeting
 	// when the poll has no LLM-authored greeting variants.
 	AgentName string
+	// Pacing delivers a turn as two beats — a short acknowledgment, a brief
+	// pause, then the question — instead of one breath, so the agent connects to
+	// the next question like a person. Off restores single-utterance delivery.
+	Pacing bool
 }
 
 // outMsg is a server->client control frame.
@@ -378,7 +382,7 @@ func (cv *conversation) askNextOrFinish(lead string) bool {
 	cv.awaitingConfirm = false
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	cv.speakQ(withLead(lead, q.Text), idx, total)
+	cv.speakPaced(lead, q.Text, idx, total)
 	return false
 }
 
@@ -588,7 +592,58 @@ func (cv *conversation) handleGreeting(text string) bool {
 	// don't ask the first question yet; we wait for their go-ahead (handleStart).
 	cv.awaitingStart = true
 	lead := cv.composeGreetingLead(text, strings.TrimSpace(turn.Ack))
+
+	// Pace it like the survey turns: the reaction ("Glad to hear it!") is its own
+	// beat, then a pause, then the framing + "ready?" — instead of one breath.
+	if reaction, framing, ok := splitGreetingBeats(lead); cv.h.Pacing && ok {
+		cv.speakTwoBeats(
+			outMsg{Type: "agent_say", Text: reaction, Kind: "greeting"}, reaction,
+			outMsg{Type: "agent_add", Text: framing, Kind: "greeting"}, framing,
+		)
+		return false
+	}
 	cv.speak(lead, "greeting")
+	return false
+}
+
+// splitGreetingBeats divides the authored greeting reply into a reaction beat and
+// a framing beat so they can be delivered as two paced bubbles. It cuts at the
+// first sentence that opens with a transition connective ("So,", "Alright,", …)
+// — the seam the greeting prompt is built around — so all the reaction lands in
+// beat 1 and the framing + "ready?" in beat 2. Falls back to first-sentence /
+// rest, and returns ok=false when it can't split cleanly (→ single beat).
+func splitGreetingBeats(lead string) (reaction, framing string, ok bool) {
+	sents := splitSentences(strings.TrimSpace(lead))
+	if len(sents) < 2 {
+		return "", "", false
+	}
+	cut := -1
+	for i := 1; i < len(sents); i++ {
+		if startsWithTransition(sents[i]) {
+			cut = i
+			break
+		}
+	}
+	if cut == -1 {
+		cut = 1 // no transition marker → first sentence is the reaction
+	}
+	reaction = strings.TrimSpace(strings.Join(sents[:cut], " "))
+	framing = strings.TrimSpace(strings.Join(sents[cut:], " "))
+	if reaction == "" || framing == "" {
+		return "", "", false
+	}
+	return reaction, framing, true
+}
+
+// startsWithTransition reports whether a sentence opens with a bridging
+// connective that marks the pivot from small-talk into the survey framing.
+func startsWithTransition(s string) bool {
+	s = strings.TrimSpace(s)
+	for _, t := range []string{"So", "Alright", "Okay", "OK", "Now", "Right", "Well"} {
+		if strings.HasPrefix(s, t+" ") || strings.HasPrefix(s, t+",") || strings.HasPrefix(s, t+" —") {
+			return true
+		}
+	}
 	return false
 }
 
@@ -732,8 +787,7 @@ func (cv *conversation) startSurvey(lead string) bool {
 	}
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	opening := withLead(lead, q.Text)
-	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
+	cv.speakPaced(lead, q.Text, idx, total)
 	return false
 }
 
@@ -770,7 +824,15 @@ func (cv *conversation) speak(text, kind string) {
 func (cv *conversation) emit(msg outMsg, ttsText string) {
 	cv.speaking = true
 	cv.send(msg)
-	for _, chunk := range splitSentences(ttsText) {
+	cv.streamTTS(ttsText)
+	cv.send(outMsg{Type: "tts_end"})
+}
+
+// streamTTS synthesizes text sentence-by-sentence and writes each as its own
+// binary frame. It does NOT bracket the turn (no tts_end) — callers that build
+// multi-beat turns (speakPaced) stream several segments before one tts_end.
+func (cv *conversation) streamTTS(text string) {
+	for _, chunk := range splitSentences(text) {
 		wav, err := cv.h.Speech.Synthesize(chunk)
 		if err != nil {
 			log.Printf("tts error: %v", err)
@@ -781,6 +843,52 @@ func (cv *conversation) emit(msg outMsg, ttsText string) {
 			return
 		}
 	}
+}
+
+// pacingPauseMS is the beat between the acknowledgment and the question. The
+// research band is ~250–500ms: long enough to read as a natural breath, short
+// enough to stay well under the ~700ms mark where a silence starts to signal a
+// dispreferred/negative response.
+const pacingPauseMS = 400
+
+// speakPaced delivers a question as TWO beats — a short acknowledgment, a brief
+// pause, then the question — so the agent connects to the next question like a
+// person instead of reading ack+question in one breath. The whole thing is ONE
+// turn from the client's view: a single tts_end at the end, so the mic re-arms
+// only after both beats drain (never mid-turn). The pause is a silent-PCM buffer
+// (Kokoro has no SSML). An empty ack — or pacing disabled — collapses to a
+// single beat with no pause, so weak-model/no-ack turns stay clean.
+func (cv *conversation) speakPaced(ack, question string, idx, total int) {
+	ack = strings.TrimSpace(ack)
+	if !cv.h.Pacing || ack == "" {
+		cv.speakQ(withLead(ack, question), idx, total)
+		return
+	}
+	// Beat 1 = the acknowledgment (its own bubble, no progress); beat 2 = the
+	// question (second bubble, carries the progress so the bar advances there).
+	cv.speakTwoBeats(
+		outMsg{Type: "agent_say", Text: ack, Kind: "ack"}, ack,
+		outMsg{Type: "agent_add", Text: question, Kind: "question", Index: idx, Total: total}, question,
+	)
+}
+
+// speakTwoBeats delivers a turn as two spoken beats with a pause between, as ONE
+// turn (a single trailing tts_end) so the mic re-arms only after both beats
+// drain — never mid-turn. The two control frames let each beat set its own
+// kind/progress. The pause is a silent-PCM buffer (Kokoro has no SSML), inside
+// the same continuous playback the client already handles.
+func (cv *conversation) speakTwoBeats(firstMsg outMsg, firstText string, secondMsg outMsg, secondText string) {
+	cv.speaking = true
+	cv.send(firstMsg)
+	cv.streamTTS(firstText)
+	if wav := cv.h.Speech.Silence(pacingPauseMS); len(wav) > 0 {
+		if err := cv.c.WriteMessage(websocket.BinaryMessage, wav); err != nil {
+			cv.speaking = false
+			return
+		}
+	}
+	cv.send(secondMsg)
+	cv.streamTTS(secondText)
 	cv.send(outMsg{Type: "tts_end"})
 }
 

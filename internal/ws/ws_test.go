@@ -179,6 +179,35 @@ func TestGreetingLine(t *testing.T) {
 	}
 }
 
+// TestSplitGreetingBeats: the authored greeting reply splits at the transition
+// connective so the reaction is beat 1 and the framing + "ready?" is beat 2;
+// un-splittable input returns ok=false (→ single beat).
+func TestSplitGreetingBeats(t *testing.T) {
+	r, f, ok := splitGreetingBeats("Glad to hear it, even with a busy morning! So I've got five questions about candles — ready to dive in?")
+	if !ok || r != "Glad to hear it, even with a busy morning!" {
+		t.Errorf("reaction beat wrong: ok=%v r=%q", ok, r)
+	}
+	if !strings.HasPrefix(f, "So I've got") || !strings.HasSuffix(f, "ready to dive in?") {
+		t.Errorf("framing beat should carry the framing + ready-check; got %q", f)
+	}
+
+	// Two reaction sentences before the transition → both land in beat 1.
+	r, f, ok = splitGreetingBeats("I'm doing well, thanks! Glad your day's good. Alright, I've got three questions — sound good?")
+	if !ok || !strings.Contains(r, "thanks!") || !strings.Contains(r, "Glad your day's good.") || !strings.HasPrefix(f, "Alright") {
+		t.Errorf("multi-sentence reaction mis-split: r=%q f=%q", r, f)
+	}
+
+	// No transition marker → first sentence is the reaction.
+	if r, f, ok = splitGreetingBeats("Nice to hear. I've got a couple questions for you, ready?"); !ok || r != "Nice to hear." {
+		t.Errorf("no-transition fallback should cut after first sentence; r=%q f=%q ok=%v", r, f, ok)
+	}
+
+	// Single sentence → can't split.
+	if _, _, ok := splitGreetingBeats("Ready to dive in?"); ok {
+		t.Errorf("single sentence should not split")
+	}
+}
+
 // TestHelpPrompt: a needs-help turn leads with the classifier's reassurance (or
 // a neutral fallback) and always re-poses the question so the respondent gets a
 // real second shot at answering.

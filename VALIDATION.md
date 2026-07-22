@@ -211,6 +211,33 @@ curl -s localhost:8090/api/polls -H 'content-type: application/json' \
   | python3 -m json.tool   # questions should center on the new dishes
 ```
 
+### Two-beat pacing (connect turns like a person)
+
+Each forward transition is delivered as TWO beats — a short acknowledgment, a
+~400ms pause, then the question — instead of ack+question in one breath, so the
+agent connects to the next question the way a person would. Applies to the
+answer→next-question advance (`askNextOrFinish`), the opening question after the
+consent gate (`startSurvey`), and the greeting reply itself (reaction beat →
+framing + "ready?" beat, split by `splitGreetingBeats`). Toggle `-pacing`
+(default on). Full design + sources in `docs/PACING-RESEARCH.md`.
+
+Mechanics (the important part): both beats are ONE turn — a single trailing
+`tts_end` — so the mic re-arms only after both drain, never mid-turn (the
+multi-segment hazard that makes an agent talk over itself). The pause is a
+silent-PCM buffer from `speech.Silence` (Kokoro has no SSML), played inside the
+same continuous stream; a new `agent_add` control message appends the second
+transcript bubble + progress without resetting the turn. An empty ack — or
+`-pacing=false` — collapses to a single beat with no pause, so weak-model/no-ack
+turns behave exactly as before. `speakTwoBeats`/`splitGreetingBeats` are unit
+tested (`TestSplitGreetingBeats`).
+
+Last validated (2026-07-22, browser E2E, `-classify-model claude-sonnet-5`,
+candles): every question arrived as its own bubble preceded by a specific ack
+("A few evenings a week, noted." → the burn-time question); the greeting reply
+split into "Glad it's going well despite the busy morning!" + "So I've got two
+questions … Ready to jump in?"; both runs reached `end_reason=completed` with all
+slots answered — proving the mic re-armed correctly after every paced turn.
+
 ### "Needs help" — when the respondent doesn't know how to answer
 
 Some replies aren't answers, refusals, or off-topic asides — they're the person
