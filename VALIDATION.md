@@ -202,10 +202,17 @@ go run ./cmd/server -classify-model claude-sonnet-5
 
 - **Happy path** — poll `4cebed5b6a`, 5 questions auto-answered, `end_reason=completed`.
 - **Silence** — poll `f080ec5d06`, no answer, one reprompt, `end_reason=silence`.
-- **Repair (unclear)** — poll `56a1299bd6`, classifier `claude-sonnet-5`, candles.
-  Calque answer ("very perfumed and I like too much… price is a little salty") →
-  agent confirmed verbatim → "yes exactly" → advanced. `end_reason=completed`,
-  and Q1 stored the calque (not the "yes"). (observed live in Chrome 2026-07-21)
+- **Repair — keep-original branch** — poll `56a1299bd6`, classifier
+  `claude-sonnet-5`, candles. Calque answer ("very perfumed and I like too much…
+  price is a little salty") → agent confirmed verbatim → "yes exactly"
+  (affirmation) → advanced. `end_reason=completed`, Q1 stored the calque (not the
+  "yes").
+- **Repair — record-correction branch** — poll `b4e20dfde7`, classifier
+  `gemma4:31b-cloud`, candles. Same calque → repair fired → confirm reply was a
+  substantive (non-affirmation) answer → server recorded it as the correction,
+  Q1 stored the new text. `end_reason=completed`.
+  (both observed live in Chrome 2026-07-21; gemma flagged the calque `unclear`
+  just as its 91.3% eval clarity predicts)
 
 > Note: the greeting is a long clip and the silence window is 9s. When answering
 > manually, answer promptly or the silence backstop may fire first — the
