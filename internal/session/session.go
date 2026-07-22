@@ -22,8 +22,8 @@ type Poll struct {
 	Product   string           `json:"product"`
 	Questions []string         `json:"questions"`
 	// Intro is a warm, product-tailored opening line authored by the LLM at
-	// creation time and spoken before the first question. Empty falls back to a
-	// fixed greeting at runtime.
+	// creation time and spoken before the first question when the greeting
+	// pre-layer is off. Empty falls back to a fixed line at runtime.
 	Intro     string           `json:"intro,omitempty"`
 	CreatedAt time.Time        `json:"created_at"`
 	Survey    *survey.Survey   `json:"survey,omitempty"`
@@ -51,7 +51,7 @@ func NewStore(dir string) (*Store, error) {
 }
 
 // Create registers a new poll from a product description, question set, and an
-// optional LLM-authored opening line.
+// optional LLM-authored intro line.
 func (s *Store) Create(product string, questions []string, intro string) *Poll {
 	p := &Poll{
 		ID:        newID(),

@@ -21,7 +21,9 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -58,6 +60,9 @@ type Handler struct {
 	// Greeting opens each session with a short "how's your day" exchange before
 	// the survey (a warm human hello), reusing the classifier to read the reply.
 	Greeting bool
+	// AgentName is the voice agent's name, used in the fixed fallback greeting
+	// when the poll has no LLM-authored greeting variants.
+	AgentName string
 }
 
 // outMsg is a server->client control frame.
@@ -501,12 +506,36 @@ func (cv *conversation) greetAndAskFirst() {
 // we hand the classifier when reading the reply.
 const greetingQuestion = "How's your day going so far?"
 
-// openGreeting speaks the warm hello and waits for the reply (handled by
-// handleGreeting). It touches no survey state — this turn is pure small-talk.
+// openGreeting speaks the warm hello (the agent introduces herself by name, says
+// she'll ask a few quick questions about the product, and asks how the day is
+// going) and waits for the reply. Touches no survey state.
 func (cv *conversation) openGreeting() {
 	cv.inGreeting = true
-	line := "Hey, thanks for taking a moment! Before we dive in — " + greetingQuestion
+	line := greetingLine(cv.h.AgentName, cv.poll.Product)
 	cv.emit(outMsg{Type: "agent_say", Text: line, Kind: "greeting"}, line)
+}
+
+// greetingTemplates are curated spoken openers. Each introduces the agent by
+// name, frames the survey (a few quick questions about the product), and ends by
+// asking how the person's day is going. We use hand-written templates rather
+// than LLM generation because the offline question-gen model (3B) proved too
+// weak to self-introduce reliably (it addressed the respondent by the agent's
+// name). %[1]s = agent name, %[2]s = product. Picked at random per session so
+// the opener varies. Keep every variant ending on a "how are you" so the reply
+// is a wellbeing answer the classifier can read.
+var greetingTemplates = []string{
+	"Hi there, I'm %[1]s! I've got just a few quick questions about %[2]s — but first, how's your day going?",
+	"Hey, %[1]s here! Before we get into a few quick questions about %[2]s, how are you doing today?",
+	"Hello! My name's %[1]s, and I'll ask you a handful of quick questions about %[2]s. But tell me first — how's your day treating you?",
+	"Hi! I'm %[1]s. In a moment I'll ask a few quick questions about %[2]s, but first — how are you today?",
+}
+
+// greetingLine fills a random greeting template with the agent name and product.
+func greetingLine(name, product string) string {
+	if name = strings.TrimSpace(name); name == "" {
+		name = "Ava"
+	}
+	return fmt.Sprintf(greetingTemplates[rand.Intn(len(greetingTemplates))], name, strings.TrimSpace(product))
 }
 
 // handleGreeting reads the reply to the opening small-talk. It reuses the turn
@@ -551,16 +580,17 @@ func (cv *conversation) startSurvey(lead string) bool {
 	}
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	opening := surveyOpening(lead, cv.poll.Product, q.Text)
+	opening := surveyOpening(lead, q.Text)
 	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
 	return false
 }
 
 // surveyOpening composes the post-greeting first turn: caring lead + a brief
-// framing bridge + the first question, all in one clip (half-duplex).
-func surveyOpening(lead, product, question string) string {
-	bridge := "Let's jump in — just a few quick questions about " + product +
-		", and there are no wrong answers. Here's the first:"
+// bridge + the first question, all in one clip (half-duplex). The greeting
+// already named the product and introduced the agent, so the bridge only adds a
+// light reassurance and hands off — no second greeting or product restatement.
+func surveyOpening(lead, question string) string {
+	bridge := "Alright — no wrong answers here, just your honest take. Here's the first:"
 	return withLead(lead, withLead(bridge, question))
 }
 

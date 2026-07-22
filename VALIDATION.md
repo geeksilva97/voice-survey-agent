@@ -144,27 +144,41 @@ Anthropic models read the key from `$ANTHROPIC_API_KEY`, else `-anthropic-env`
 (defaults to pepita's `.env`). Ollama/`:cloud` models need no key. Every turn
 now costs a round-trip to that model, so expect a little more latency per reply.
 
-### Greeting pre-layer (a human hello before the survey)
+### Greeting pre-layer (a named agent says hello like a person)
 
-Sessions open with a short small-talk exchange before any question — *"Hey,
-thanks for taking a moment! Before we dive in — how's your day going so far?"* —
-so the agent says hello like a person, not a form. The respondent's reply is read
-with the **existing** turn classifier (one call, no new prompt, no extra
-latency): if they bail ("actually I don't have time") the session ends
-gracefully; otherwise the classifier's `ack` becomes a warm, specific caring line
-(*"Glad to hear!"*, *"Ah, sorry to hear that."*) that leads straight into the
-survey (caring line + a brief framing bridge + Q1, one clip — no second "hi").
+Sessions open with a small-talk hello before any question, so the agent greets
+like a person, not a form. The agent has a **name** (default **Ava**, set with
+`-agent-name`) and introduces herself, says she'll ask a few quick questions
+about the product, and asks how the person's day is going — e.g. *"Hi, I'm Ava!
+I've got a few quick questions about your candles — but first, how's your day
+going?"*
 
-It's a SINGLE exchange — the agent never loops on the greeting, so the survey
-starts promptly. Silence or a cough during the greeting falls through the normal
-silence backstop / non-speech guard. Toggle with `-greeting` (default on); off
-restores the LLM-authored intro opening. `surveyOpening` is unit tested
-(`TestSurveyOpening`). Caring-line quality tracks model strength (like acks): on
-the 3B the ack may be empty, so it opens with the neutral-warm fallback.
+Greetings **vary**: `greetingLine` picks from a set of curated templates at
+random per session (name + product filled in), so the opener differs across
+sessions with zero runtime latency. These are hand-written rather than
+LLM-generated on purpose — the offline question-gen model (3B) proved too weak to
+self-introduce reliably (it addressed the *respondent* by the agent's name), so
+templates keep the signature hello correct regardless of model. Unit tested
+(`TestGreetingLine`). (A stronger question-gen model could generate greetings per
+poll later; templates are the reliable default.)
+
+The reply is read with the **existing** turn classifier (one call, no new prompt,
+no extra latency): a bail ends the session gracefully; otherwise the classifier's
+`ack` becomes a warm, specific caring line (*"Glad to hear — busy but good."*)
+that leads into the survey (caring line + a light "no wrong answers" bridge + Q1,
+one clip — the greeting already named the product, so no second hello or product
+restatement). `surveyOpening` is unit tested (`TestSurveyOpening`).
+
+It's a SINGLE exchange — never loops, so the survey starts promptly. Silence or a
+cough during the greeting falls through the normal silence backstop / non-speech
+guard. Caring-line quality tracks model strength (like acks): on the 3B the ack
+may be empty, so it opens with a neutral-warm fallback. Toggle the whole layer
+with `-greeting` (default on); off restores the LLM-authored intro opening.
 
 ```bash
-go run ./cmd/server                  # greeting on (default)
-go run ./cmd/server -greeting=false  # straight into the intro + first question
+go run ./cmd/server                        # greeting on (default), agent "Ava"
+go run ./cmd/server -agent-name=Nova       # rename the agent
+go run ./cmd/server -greeting=false        # straight into the intro + first question
 ```
 
 ### "Needs help" — when the respondent doesn't know how to answer

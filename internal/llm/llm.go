@@ -58,9 +58,16 @@ func (c *Client) chat(ctx context.Context, temp float64, format json.RawMessage,
 // ---- Question generation ----
 
 // SurveyPlan is a freshly generated survey: its questions plus a warm,
-// product-tailored opening line the agent speaks before the first question.
-// Intro is best-effort — it may be empty, in which case the caller falls back
-// to a fixed greeting.
+// product-tailored opening line the agent speaks before the first question
+// (used when the greeting pre-layer is off). Intro is best-effort — it may be
+// empty, in which case the caller falls back to a fixed line.
+//
+// Note: the spoken small-talk GREETING (agent introduces herself by name, asks
+// how the day is going) is NOT generated here. The offline question-gen model
+// (qwen 3B) proved too weak to reliably self-introduce — it addressed the
+// respondent by the agent's name — so the greeting uses curated, correct
+// templates instead (see internal/ws greetingLine). This keeps the signature
+// hello reliably right regardless of model.
 type SurveyPlan struct {
 	Questions []string
 	Intro     string

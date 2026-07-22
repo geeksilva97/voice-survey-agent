@@ -81,22 +81,41 @@ func TestFollowUpPrompt(t *testing.T) {
 }
 
 // TestSurveyOpening: after the greeting, the first turn leads with the caring
-// line, adds a brief framing bridge (no second "hi"), and ends with the question.
+// line, adds a brief bridge (no second "hi", no product restatement — the
+// greeting already covered those), and ends with the question.
 func TestSurveyOpening(t *testing.T) {
 	q := "How do you like the scent?"
-	got := surveyOpening("Glad to hear!", "our candles", q)
+	got := surveyOpening("Glad to hear!", q)
 	if !strings.HasPrefix(got, "Glad to hear!") {
 		t.Errorf("opening should lead with the caring line; got %q", got)
 	}
-	if !strings.Contains(got, "our candles") || !strings.HasSuffix(got, q) {
-		t.Errorf("opening should frame the product and end with the question; got %q", got)
+	if !strings.HasSuffix(got, q) {
+		t.Errorf("opening should end with the question; got %q", got)
 	}
 	if strings.Contains(strings.ToLower(got), "hi ") || strings.Contains(got, "Hello") {
 		t.Errorf("opening must not greet again after the greeting turn; got %q", got)
 	}
-	// No caring lead (empty ack) → still a clean framing + question, no dangling space.
-	if got := surveyOpening("", "candles", q); !strings.HasPrefix(got, "Let's jump in") {
+	// No caring lead (empty ack) → still a clean bridge + question, no dangling space.
+	if got := surveyOpening("", q); !strings.HasPrefix(got, "Alright") {
 		t.Errorf("empty lead should start with the bridge; got %q", got)
+	}
+}
+
+// TestGreetingLine: every template introduces the agent by name, names the
+// product, and asks how they are (so the reply is a wellbeing answer). Blank
+// name defaults to Ava.
+func TestGreetingLine(t *testing.T) {
+	for i := 0; i < 30; i++ {
+		g := greetingLine("Ava", "hand-poured candles")
+		if !strings.Contains(g, "Ava") || !strings.Contains(g, "hand-poured candles") {
+			t.Fatalf("greeting must name the agent and product; got %q", g)
+		}
+		if !strings.Contains(g, "?") {
+			t.Fatalf("greeting must ask how they are; got %q", g)
+		}
+	}
+	if g := greetingLine("  ", "candles"); !strings.Contains(g, "Ava") {
+		t.Errorf("blank name should default to Ava; got %q", g)
 	}
 }
 
