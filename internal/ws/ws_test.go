@@ -3,6 +3,8 @@ package ws
 import (
 	"strings"
 	"testing"
+
+	"voicesurvey/internal/llm"
 )
 
 // TestIsAffirmation locks down the yes/no rule that decides, after a repair
@@ -40,5 +42,39 @@ func TestRepairPrompt(t *testing.T) {
 	}
 	if !strings.Contains(p, "another way") {
 		t.Errorf("repairPrompt should invite a rephrase; got %q", p)
+	}
+}
+
+// TestWithLead checks the acknowledgment lead-in is prepended (spaced) when
+// present and is a no-op otherwise.
+func TestWithLead(t *testing.T) {
+	q := "What's your favorite scent?"
+	if got := withLead("Comfier seating, got it.", q); got != "Comfier seating, got it. "+q {
+		t.Errorf("withLead should prepend the ack; got %q", got)
+	}
+	if got := withLead("   ", q); got != q {
+		t.Errorf("blank ack should be a no-op; got %q", got)
+	}
+}
+
+// TestFollowUpPrompt: an off-topic aside leads with the classifier's ack and
+// re-poses the question (warm steer-back), not a robotic "let me ask again".
+func TestFollowUpPrompt(t *testing.T) {
+	q := "How often do you burn candles at home?"
+
+	got := followUpPrompt(llm.IntentOffTopic, "Ha, no worries —", q)
+	if !strings.HasPrefix(got, "Ha, no worries —") || !strings.Contains(got, q) {
+		t.Errorf("off-topic should lead with the ack and re-pose the question; got %q", got)
+	}
+
+	// No ack from the model → neutral redirect, still re-poses the question.
+	got = followUpPrompt(llm.IntentOffTopic, "", q)
+	if !strings.Contains(got, q) || strings.Contains(got, "let me ask again") {
+		t.Errorf("off-topic fallback should re-pose the question without the robotic phrasing; got %q", got)
+	}
+
+	// A vague on-topic answer gets a gentle probe, not a re-read.
+	if got := followUpPrompt(llm.IntentAnswer, "", q); strings.Contains(got, q) {
+		t.Errorf("vague-answer probe should not re-read the question; got %q", got)
 	}
 }

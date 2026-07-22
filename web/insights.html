@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Survey — Insights</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1420; --card:#1a2233; --card2:#141b2a; --fg:#e8edf6; --mut:#93a1b8; --acc:#6ea8fe; --ok:#4cd07d; --warn:#e0b64c; --bad:#ff6b6b; --line:#2a3550; }
+  @media (prefers-color-scheme: light){ :root{ --bg:#f4f6fb; --card:#fff; --card2:#f7f9fd; --fg:#16202e; --mut:#5a6b83; --acc:#2f6fed; --ok:#1a9e54; --warn:#a67c15; --bad:#d23c3c; --line:#e2e8f2; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  .wrap { max-width:760px; margin:0 auto; padding:44px 20px 80px; }
+  h1 { font-size:1.5rem; margin:0 0 2px; }
+  .meta { color:var(--mut); margin:0 0 8px; font-size:.9rem; }
+  a.back { color:var(--acc); text-decoration:none; font-size:.85rem; }
+  a.back:hover { text-decoration:underline; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:99px; font-size:.78rem; font-weight:700; }
+  .b-completed { background:rgba(76,208,125,.18); color:var(--ok); }
+  .b-bailed, .b-silence { background:rgba(224,182,76,.18); color:var(--warn); }
+  .b-pending { background:var(--line); color:var(--mut); }
+  .s-positive { background:rgba(76,208,125,.18); color:var(--ok); }
+  .s-mixed { background:rgba(224,182,76,.18); color:var(--warn); }
+  .s-negative { background:rgba(255,107,107,.18); color:var(--bad); }
+
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px 22px; margin:18px 0; }
+  .panel h2 { font-size:.78rem; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 12px; font-weight:700; }
+  .top { display:flex; gap:20px; flex-wrap:wrap; align-items:center; }
+  .overall { text-align:center; min-width:110px; }
+  .overall .num { font-size:2.6rem; font-weight:800; line-height:1; color:var(--acc); }
+  .overall .den { color:var(--mut); font-size:1rem; }
+  .overall .lbl { font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:var(--mut); margin-top:4px; }
+  .divider { width:1px; align-self:stretch; background:var(--line); }
+  .senti { flex:1; min-width:220px; }
+  .senti .rationale { color:var(--mut); margin-top:8px; font-size:.94rem; }
+  .summary { margin:0; }
+
+  .qa { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin:12px 0; }
+  .q { font-weight:600; }
+  .a { margin-top:6px; }
+  .a.empty { color:var(--mut); font-style:italic; }
+  .tag { float:right; font-size:.72rem; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
+  .scores { display:flex; gap:22px; flex-wrap:wrap; margin-top:14px; padding-top:12px; border-top:1px dashed var(--line); }
+  .score { flex:1; min-width:200px; }
+  .score .name { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
+  .score .row { display:flex; align-items:center; gap:8px; margin-top:3px; }
+  .dots { display:inline-flex; gap:3px; }
+  .dot { width:11px; height:11px; border-radius:50%; background:var(--line); }
+  .dot.on-use { background:var(--acc); }
+  .dot.on-conf { background:var(--ok); }
+  .score .val { font-weight:700; font-size:.9rem; }
+  .score .note { color:var(--mut); font-size:.84rem; margin-top:2px; }
+
+  .status { color:var(--mut); text-align:center; padding:40px 0; }
+  .spin { display:inline-block; width:18px; height:18px; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-3px; margin-right:8px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .err { color:var(--bad); }
+  .modelnote { color:var(--mut); font-size:.78rem; margin-top:24px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" id="back" href="#">&larr; back to results</a>
+  <h1 id="title">Response insights</h1>
+  <p class="meta" id="meta"></p>
+
+  <div id="status" class="status"><span class="spin"></span>Scoring this response with the local LLM… (first run can take a few seconds)</div>
+  <div id="content" style="display:none">
+    <div class="panel">
+      <h2>Overall</h2>
+      <div class="top">
+        <div class="overall">
+          <div><span class="num" id="overall">–</span><span class="den">/5</span></div>
+          <div class="lbl">Response value</div>
+        </div>
+        <div class="divider"></div>
+        <div class="senti">
+          <div>Product sentiment: <span class="badge" id="sentiment">–</span></div>
+          <div class="rationale" id="sentRationale"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Summary</h2>
+      <p class="summary" id="summary"></p>
+    </div>
+    <h2 style="font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:26px 0 4px;">Per-answer scoring</h2>
+    <div id="list"></div>
+    <p class="modelnote" id="modelnote"></p>
+  </div>
+  <p class="err" id="err"></p>
+</div>
+<script>
+const id = location.pathname.split("/").pop();
+document.getElementById("back").href = "/results/" + id;
+
+function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function dots(n, cls){
+  let h = '<span class="dots">';
+  for (let i=1;i<=5;i++) h += `<span class="dot ${i<=n?('on-'+cls):''}"></span>`;
+  return h + '</span>';
+}
+const useLabel = n => n>=4 ? "High" : n>=3 ? "Medium" : "Low";
+const confLabel = n => n>=4 ? "Confident" : n>=3 ? "Some hedging" : "Hedging";
+
+(async () => {
+  try {
+    // Poll meta (product, end reason, timestamp).
+    const pr = await fetch("/api/polls/" + id);
+    if (pr.ok) {
+      const p = await pr.json();
+      document.getElementById("title").textContent = "Insights — " + p.product;
+      const reason = p.end_reason || "pending";
+      const label = { completed:"Completed", bailed:"Ended early", silence:"Timed out", pending:"Not taken yet" }[reason] || reason;
+      document.getElementById("meta").innerHTML =
+        `<span class="badge b-${reason}">${label}</span> &nbsp; created ${new Date(p.created_at).toLocaleString()}`;
+    }
+
+    // Insights (may take a few seconds on first run — the server computes on demand).
+    const r = await fetch("/api/polls/" + id + "/insights");
+    if (!r.ok) throw new Error(r.statusText);
+    const ins = await r.json();
+
+    document.getElementById("overall").textContent = (ins.overall ?? 0).toFixed(1);
+
+    const sent = (ins.sentiment || "mixed").toLowerCase();
+    const sb = document.getElementById("sentiment");
+    sb.textContent = sent.charAt(0).toUpperCase() + sent.slice(1);
+    sb.className = "badge s-" + sent;
+    document.getElementById("sentRationale").textContent = ins.sentiment_rationale || "";
+    document.getElementById("summary").textContent = ins.summary || "";
+
+    const list = document.getElementById("list");
+    (ins.answers || []).forEach((a, i) => {
+      const answered = a.answer && a.answer.trim();
+      const div = document.createElement("div");
+      div.className = "qa";
+      div.innerHTML =
+        `<span class="tag">${esc(a.status)}</span>` +
+        `<div class="q">${i+1}. ${esc(a.question)}</div>` +
+        (answered ? `<div class="a">${esc(a.answer)}</div>` : `<div class="a empty">— no answer —</div>`) +
+        `<div class="scores">` +
+          `<div class="score"><div class="name">Answer usefulness</div>` +
+            `<div class="row">${dots(a.usefulness, 'use')}<span class="val">${useLabel(a.usefulness)} (${a.usefulness}/5)</span></div>` +
+            (a.usefulness_note ? `<div class="note">${esc(a.usefulness_note)}</div>` : ``) +
+          `</div>` +
+          `<div class="score"><div class="name">Answer confidence</div>` +
+            `<div class="row">${dots(a.confidence, 'conf')}<span class="val">${confLabel(a.confidence)} (${a.confidence}/5)</span></div>` +
+            (a.confidence_note ? `<div class="note">${esc(a.confidence_note)}</div>` : ``) +
+          `</div>` +
+        `</div>`;
+      list.appendChild(div);
+    });
+
+    let mn = "";
+    if (ins.model) mn += "scored by " + esc(ins.model);
+    if (ins.generated_at) mn += " · " + new Date(ins.generated_at).toLocaleString();
+    document.getElementById("modelnote").innerHTML = mn;
+
+    document.getElementById("status").style.display = "none";
+    document.getElementById("content").style.display = "block";
+  } catch (e) {
+    document.getElementById("status").style.display = "none";
+    document.getElementById("err").textContent = "Could not load insights: " + e.message;
+  }
+})();
+</script>
+</body>
+</html>

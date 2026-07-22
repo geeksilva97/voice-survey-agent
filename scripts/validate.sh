@@ -53,7 +53,8 @@ echo "== 5. intent-classification eval (labeled corpus vs live LLM) =="
 # Gate runs the LOCAL model only (fast/offline). For the full cross-model
 # comparison matrix run: go run ./cmd/eval   (defaults to all models).
 if [ "$OLLAMA_UP" = 1 ]; then
-  EVAL_OUT=$(go run ./cmd/eval -models "$MODEL" 2>&1)
+  # -judge "" keeps the gate offline (the default ack judge is an Anthropic model).
+  EVAL_OUT=$(go run ./cmd/eval -models "$MODEL" -judge "" 2>&1)
   echo "$EVAL_OUT" | grep -E 'EVAL (PASSED|FAILED)'
   if echo "$EVAL_OUT" | grep -q 'EVAL PASSED'; then pass "intent eval (acc>=90%, answer>=95%)"; else fail "intent eval"; echo "$EVAL_OUT" | tail -25; fi
 else

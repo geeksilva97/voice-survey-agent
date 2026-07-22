@@ -22,17 +22,21 @@
   .a.empty { color:var(--mut); font-style:italic; }
   .tag { float:right; font-size:.72rem; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
   .err { color:#ff6b6b; }
+  .cta { display:inline-block; margin:8px 0 20px; padding:9px 16px; border-radius:10px; background:var(--acc); color:#fff; text-decoration:none; font-weight:600; font-size:.9rem; }
+  .cta:hover { filter:brightness(1.08); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1 id="title">Results</h1>
   <p class="meta" id="meta"></p>
+  <a class="cta" id="insightsLink" href="#">View scored insights &rarr;</a>
   <div id="list"></div>
   <p class="err" id="err"></p>
 </div>
 <script>
 const id = location.pathname.split("/").pop();
+document.getElementById("insightsLink").href = "/insights/" + id;
 (async () => {
   try {
     const r = await fetch("/api/polls/" + id);

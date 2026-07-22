@@ -218,7 +218,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 
 	q, ok := cv.sv.Current()
 	if !ok {
-		return cv.finishCompleted()
+		return cv.finishCompleted("")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -249,7 +249,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		}
 		cv.sv.RecordAnswer(ans)
 		cv.persist()
-		return cv.askNextOrFinish()
+		return cv.askNextOrFinish("")
 	}
 
 	// Early bail-out (Phase 4): respondent wants to stop the WHOLE survey.
@@ -274,7 +274,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		// Asked too many times — skip this one and move on.
 		cv.sv.CaptureAndAdvance("")
 		cv.persist()
-		return cv.askNextOrFinish()
+		return cv.askNextOrFinish("")
 	}
 
 	// A sufficient, on-topic answer.
@@ -291,43 +291,63 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		}
 		cv.sv.RecordAnswer(text)
 		cv.persist()
-		return cv.askNextOrFinish()
+		// Acknowledge what they said, then move on — this warm, specific lead-in
+		// is what makes the survey feel like a conversation instead of a form.
+		return cv.askNextOrFinish(turn.Ack)
 	}
 
-	// Weak / off-topic / unintelligible: probe once, then move on.
+	// Off-topic / unintelligible: acknowledge + steer back to the question once.
+	// A vague-but-on-topic answer (answer, insufficient) gets a gentle probe.
 	if cv.sv.FollowUp() {
-		cv.speak(followUpPrompt(turn.Intent, q.Text), "followup")
+		cv.speak(followUpPrompt(turn.Intent, turn.Ack, q.Text), "followup")
 		return false
 	}
-	// Follow-up budget spent: capture whatever we got and advance.
-	cv.sv.CaptureAndAdvance(text)
+	// Follow-up budget spent. Don't fabricate an answer from an off-topic aside
+	// or noise — skip the slot (records it Skipped) so results stay honest. A
+	// thin but on-topic answer is still worth keeping.
+	if turn.Intent == llm.IntentOffTopic || turn.Intent == llm.IntentUnintellig {
+		cv.sv.CaptureAndAdvance("") // empty → Skipped, not a bogus answer
+	} else {
+		cv.sv.CaptureAndAdvance(text)
+	}
 	cv.persist()
-	return cv.askNextOrFinish()
+	return cv.askNextOrFinish("")
 }
 
-func (cv *conversation) askNextOrFinish() bool {
+// askNextOrFinish advances to the next unanswered question, prepending an
+// optional spoken lead-in (an acknowledgment of the previous answer). When no
+// questions remain it speaks the closing line, carrying the lead-in along.
+func (cv *conversation) askNextOrFinish(lead string) bool {
 	if done, reason := cv.sv.Done(); done {
 		if reason == survey.Completed {
-			return cv.finishCompleted()
+			return cv.finishCompleted(lead)
 		}
 	}
 	q, ok := cv.sv.Current()
 	if !ok {
-		return cv.finishCompleted()
+		return cv.finishCompleted(lead)
 	}
 	cv.reasks = 0        // new question — reset the re-ask counter
 	cv.confirmed = false // ...and the one-repair-per-question budget
 	cv.awaitingConfirm = false
 	cv.sv.MarkAsked()
 	idx, total := cv.sv.Progress()
-	cv.speakQ(q.Text, idx, total)
+	cv.speakQ(withLead(lead, q.Text), idx, total)
 	return false
 }
 
-func (cv *conversation) finishCompleted() bool {
-	cv.speak("That's everything I wanted to ask. Thank you so much for sharing your thoughts — it really helps. Goodbye!", "closing")
+func (cv *conversation) finishCompleted(lead string) bool {
+	cv.speak(withLead(lead, "That's everything I wanted to ask. Thank you so much for sharing your thoughts — it really helps. Goodbye!"), "closing")
 	cv.finalize(survey.Completed)
 	return true
+}
+
+// withLead prepends a spoken acknowledgment to the next line, if present.
+func withLead(lead, text string) string {
+	if lead = strings.TrimSpace(lead); lead == "" {
+		return text
+	}
+	return lead + " " + text
 }
 
 func (cv *conversation) endSurveyBySilence() {
@@ -340,7 +360,7 @@ func (cv *conversation) endSurveyBySilence() {
 func (cv *conversation) greetAndAskFirst() {
 	q, ok := cv.sv.Current()
 	if !ok {
-		cv.finishCompleted()
+		cv.finishCompleted("")
 		return
 	}
 	// One combined opening turn: intro + first question. Half-duplex means each
@@ -503,10 +523,18 @@ func firstWord(s string) string {
 	return s
 }
 
-func followUpPrompt(intent llm.Intent, question string) string {
+// followUpPrompt builds the agent's line when a reply wasn't a usable answer.
+// For an off-topic aside we lead with the classifier's acknowledgment (a warm,
+// specific steer-back like "Ha, no worries —") and re-pose the question, instead
+// of a robotic "let me ask again". Falls back to a neutral redirect if the model
+// gave no ack.
+func followUpPrompt(intent llm.Intent, ack, question string) string {
 	switch intent {
 	case llm.IntentOffTopic:
-		return "No problem — let me ask again. " + question
+		if lead := strings.TrimSpace(ack); lead != "" {
+			return lead + " " + question
+		}
+		return "No problem — back to it: " + question
 	case llm.IntentUnintellig:
 		return "Sorry, I didn't quite catch that. Here's the question again: " + question
 	default: // a vague but on-topic answer

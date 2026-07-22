@@ -41,6 +41,18 @@ func NewClassifier(model, anthropicKey string) (Classifier, error) {
 	return New(model)
 }
 
+// NewCompleter routes a model name to a Completer (same rules as NewClassifier).
+// Used to build the eval's ack-quality judge.
+func NewCompleter(model, anthropicKey string) (Completer, error) {
+	if IsAnthropicModel(model) {
+		if strings.TrimSpace(anthropicKey) == "" {
+			return nil, fmt.Errorf("model %q needs an Anthropic API key", model)
+		}
+		return NewAnthropic(anthropicKey, model), nil
+	}
+	return New(model)
+}
+
 // DefaultAnthropicEnvFile is where we look for a key if $ANTHROPIC_API_KEY is
 // unset — the pepita project's .env on this machine.
 func DefaultAnthropicEnvFile() string {
@@ -134,17 +146,35 @@ func (a *AnthropicClient) ClassifyTurn(ctx context.Context, question, reply stri
 	}
 	// NB: no assistant prefill — newer models require the conversation to end on
 	// a user turn. We rely on the system instruction + normalizeTurn's object
-	// extraction to get clean JSON.
-
-	body, _ := json.Marshal(anthReq{
+	// extraction to get clean JSON. max_tokens leaves room for the ack string.
+	text, err := a.do(ctx, anthReq{
 		Model:     a.model,
-		MaxTokens: 64,
+		MaxTokens: 200,
 		System:    system + " Output ONLY a single JSON object, nothing else.",
 		Messages:  am,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(body))
 	if err != nil {
 		return Turn{}, err
+	}
+	return normalizeTurn(text), nil
+}
+
+// Complete implements Completer: a one-shot system+user call returning raw text.
+func (a *AnthropicClient) Complete(ctx context.Context, system, user string) (string, error) {
+	return a.do(ctx, anthReq{
+		Model:     a.model,
+		MaxTokens: 300,
+		System:    system,
+		Messages:  []anthMsg{{Role: "user", Content: user}},
+	})
+}
+
+// do posts one Messages request and returns the concatenated text content.
+func (a *AnthropicClient) do(ctx context.Context, r anthReq) (string, error) {
+	body, _ := json.Marshal(r)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
 	}
 	req.Header.Set("x-api-key", a.key)
 	req.Header.Set("anthropic-version", anthropicVersion)
@@ -152,19 +182,19 @@ func (a *AnthropicClient) ClassifyTurn(ctx context.Context, question, reply stri
 
 	resp, err := a.hc.Do(req)
 	if err != nil {
-		return Turn{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return Turn{}, fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return "", fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 	var ar anthResp
 	if err := json.Unmarshal(raw, &ar); err != nil {
-		return Turn{}, fmt.Errorf("anthropic decode: %w", err)
+		return "", fmt.Errorf("anthropic decode: %w", err)
 	}
 	if ar.Error != nil {
-		return Turn{}, fmt.Errorf("anthropic: %s", ar.Error.Message)
+		return "", fmt.Errorf("anthropic: %s", ar.Error.Message)
 	}
 	var text strings.Builder
 	for _, c := range ar.Content {
@@ -172,7 +202,7 @@ func (a *AnthropicClient) ClassifyTurn(ctx context.Context, question, reply stri
 			text.WriteString(c.Text)
 		}
 	}
-	return normalizeTurn(text.String()), nil
+	return text.String(), nil
 }
 
 func truncate(s string, n int) string {

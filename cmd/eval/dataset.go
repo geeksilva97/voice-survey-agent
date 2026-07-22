@@ -117,6 +117,12 @@ var dataset = []evalCase{
 	{"How likely are you to recommend us?", "Hey, can you turn the lights down in here?", llm.IntentOffTopic, na},
 	{"What could we improve?", "Sorry, hold on — no, not you, I was talking to my dog.", llm.IntentOffTopic, na},
 	{"What's your favorite feature?", "By the way, where's the nearest parking lot?", llm.IntentOffTopic, na},
+	// Unrelated chit-chat as a STATEMENT (not a question) — a common tangent the
+	// model must not mistake for an "answer". From the coffee-shop transcript
+	// where the respondent kept talking about the World Cup.
+	{"What's one thing you'd like to see improved at our coffee shop?", "Did you catch that World Cup game yesterday?", llm.IntentOffTopic, na},
+	{"What's one thing you'd like to see improved at our coffee shop?", "Honestly I think Spain is going to win the whole tournament.", llm.IntentOffTopic, na},
+	{"How often do you burn candles at home?", "Man, that referee last night was a disaster, did you see it?", llm.IntentOffTopic, na},
 
 	// ---- unintelligible: noise / garbled STT output ----
 	{"What do you think of our candles?", "(buzzing) (buzzing)", llm.IntentUnintellig, na},

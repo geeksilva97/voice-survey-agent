@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"voicesurvey/internal/insight"
 	"voicesurvey/internal/llm"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
@@ -26,7 +27,8 @@ func main() {
 	webDir := flag.String("web", "web", "directory with static frontend files")
 	ollamaModel := flag.String("model", "qwen2.5:3b", "Ollama model for question generation")
 	classifyModel := flag.String("classify-model", "", "model for per-turn classification; Ollama or an Anthropic model like claude-sonnet-5 (default: -model). The repair turn fires more on stronger models.")
-	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify models)")
+	insightModel := flag.String("insight-model", "qwen2.5:3b", "model for the results-insight scoring pass; Ollama (offline) or an Anthropic model like claude-sonnet-5")
+	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
 	flag.Parse()
 
 	log.Println("loading speech models (Kokoro TTS + Whisper STT)…")
@@ -57,22 +59,37 @@ func main() {
 	if err != nil {
 		log.Fatalf("classifier: %v", err)
 	}
-	log.Printf("question-gen model: %s | classify model: %s", *ollamaModel, cm)
+
+	// The insight scorer is a fully independent one-shot Completer pass, routed
+	// the same way (Ollama offline by default, or Anthropic). It never touches
+	// the classify/ask path.
+	if llm.IsAnthropicModel(*insightModel) && anthropicKey == "" {
+		if anthropicKey, err = llm.LoadAnthropicKey(*anthropicEnv); err != nil {
+			log.Fatalf("insight model %q: %v", *insightModel, err)
+		}
+	}
+	insightLLM, err := llm.NewCompleter(*insightModel, anthropicKey)
+	if err != nil {
+		log.Fatalf("insight completer: %v", err)
+	}
+	log.Printf("question-gen model: %s | classify model: %s | insight model: %s", *ollamaModel, cm, *insightModel)
 
 	store, err := session.NewStore(*dataDir)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
 
-	app := &app{store: store, llm: llmClient, webDir: *webDir}
+	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
 	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))
 	mux.HandleFunc("POST /api/polls", app.createPoll)
 	mux.HandleFunc("GET /api/polls/{id}", app.getPoll)
+	mux.HandleFunc("GET /api/polls/{id}/insights", app.getInsights)
 	mux.HandleFunc("GET /poll/{id}", app.page("poll.html"))
 	mux.HandleFunc("GET /results/{id}", app.page("results.html"))
+	mux.HandleFunc("GET /insights/{id}", app.page("insights.html"))
 	mux.HandleFunc("GET /ws", wsHandler.Serve)
 	staticFS := http.FileServer(http.Dir(filepath.Join(*webDir, "static")))
 	mux.Handle("GET /static/", http.StripPrefix("/static/", noCache(staticFS)))
@@ -82,9 +99,11 @@ func main() {
 }
 
 type app struct {
-	store  *session.Store
-	llm    *llm.Client
-	webDir string
+	store        *session.Store
+	llm          *llm.Client
+	webDir       string
+	insightLLM   llm.Completer
+	insightModel string
 }
 
 // page serves a static HTML file from the web dir.
@@ -130,12 +149,51 @@ func (a *app) createPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) getPoll(w http.ResponseWriter, r *http.Request) {
-	poll, ok := a.store.Get(r.PathValue("id"))
+	poll, ok := a.store.GetOrLoad(r.PathValue("id"))
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	writeJSON(w, poll)
+}
+
+// getInsights computes (or returns cached) LLM scorings for a poll: product
+// sentiment, per-answer usefulness/confidence, and an overall summary. This is
+// a separate one-shot LLM pass, independent of the per-turn classifier. Pass
+// ?refresh=1 to force recomputation.
+func (a *app) getInsights(w http.ResponseWriter, r *http.Request) {
+	poll, ok := a.store.GetOrLoad(r.PathValue("id"))
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if poll.Insights != nil && r.URL.Query().Get("refresh") == "" {
+		writeJSON(w, poll.Insights)
+		return
+	}
+
+	in := insight.Input{Product: poll.Product, EndReason: string(poll.EndReason)}
+	if poll.Survey != nil {
+		for _, q := range poll.Survey.Questions {
+			in.Answers = append(in.Answers, insight.QA{Question: q.Text, Answer: q.Answer, Status: string(q.Status)})
+		}
+	} else {
+		for _, q := range poll.Questions {
+			in.Answers = append(in.Answers, insight.QA{Question: q, Status: "unasked"})
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	res, err := insight.Score(ctx, a.insightLLM, a.insightModel, in)
+	if err != nil {
+		// Score fails safe (neutral defaults), so we still serve a usable page;
+		// just log the reason so it isn't silent.
+		log.Printf("insight scoring for %s degraded: %v", poll.ID, err)
+	}
+	poll.Insights = &res
+	a.store.Save(poll)
+	writeJSON(w, res)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

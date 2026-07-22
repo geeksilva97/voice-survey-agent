@@ -142,9 +142,14 @@ type Turn struct {
 	Intent     Intent  `json:"intent"`
 	Sufficient bool    `json:"sufficient"` // did they actually answer the question?
 	Clarity    Clarity `json:"clarity"`    // did we understand the content precisely?
+	// Ack is a short, warm, SPECIFIC spoken lead-in the agent says right before
+	// the next question — it reflects what the respondent just said (a normal
+	// answer) or gently steers back (an off-topic aside). It's what makes the
+	// conversation feel human instead of a form. Empty when no lead-in fits.
+	Ack string `json:"ack"`
 }
 
-var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","repeat","off_topic","unintelligible"]},"sufficient":{"type":"boolean"},"clarity":{"type":"string","enum":["clear","unclear"]}},"required":["intent","sufficient","clarity"]}`)
+var turnFormat = json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string","enum":["answer","wants_stop","repeat","off_topic","unintelligible"]},"sufficient":{"type":"boolean"},"clarity":{"type":"string","enum":["clear","unclear"]},"ack":{"type":"string"}},"required":["intent","sufficient","clarity","ack"]}`)
 
 // Msg is a provider-neutral chat message (role: system/user/assistant). It lets
 // every backend classify with the SAME prompt so model comparisons are fair.
@@ -157,6 +162,22 @@ type Classifier interface {
 	ClassifyTurn(ctx context.Context, question, reply string) (Turn, error)
 }
 
+// Completer runs a one-shot system+user instruction and returns the raw text.
+// It's used by the eval's ack-quality judge — a generative score that is
+// separate from turn classification. Both backends implement it so the judge
+// can be a local or a hosted model.
+type Completer interface {
+	Complete(ctx context.Context, system, user string) (string, error)
+}
+
+// Complete (Ollama backend) runs a plain, un-formatted completion at temp 0.
+func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
+	return c.chat(ctx, 0, nil, []api.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	})
+}
+
 // classifyPrompt returns the shared system prompt and the conversation messages
 // (few-shot exchanges + the final user turn) for one classification. Keeping it
 // in one place means every model is judged on the exact same instructions.
@@ -164,21 +185,23 @@ func classifyPrompt(question, reply string) (system string, msgs []Msg) {
 	system = classifySystem
 	shots := []Msg{
 		{Role: "user", Content: "Question: Is there a specific type of drink you would like us to offer more often?\nReply: A banana vitamin would be awesome."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear"}`},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
 		{Role: "user", Content: "Question: What's one thing you'd improve at our coffee shop?\nReply: I don't know, maybe better chairs I guess"},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear"}`},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Comfier seating — good call."}`},
 		{Role: "user", Content: "Question: What's one thing you'd like to see improved at our coffee shop?\nReply: Nothing that comes to my mind actually."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear"}`},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, got it."}`},
 		{Role: "user", Content: "Question: How was the service?\nReply: The waiter was very educated and gentle with us."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear"}`},
+		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
 		{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Sorry, what was the question?"},
-		{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear"}`},
+		{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear","ack":""}`},
 		{Role: "user", Content: "Question: How likely are you to recommend us?\nReply: I really have to run now, sorry."},
-		{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear"}`},
+		{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear","ack":""}`},
 		{Role: "user", Content: "Question: What's your favorite scent?\nReply: What time do you close today?"},
-		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear"}`},
+		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"No worries —"}`},
+		{Role: "user", Content: "Question: How often do you burn candles at home?\nReply: Did you catch the game last night?"},
+		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"Ha, no worries —"}`},
 		{Role: "user", Content: "Question: What do you think of our candles?\nReply: (buzzing) (buzzing)"},
-		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear"}`},
+		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
 	}
 	user := fmt.Sprintf("Question: %s\nReply: %s", question, reply)
 	msgs = append(shots, Msg{Role: "user", Content: user})
@@ -205,6 +228,14 @@ func normalizeTurn(raw string) Turn {
 	if t.Clarity == "" {
 		t.Clarity = ClarityClear // conservative: only confirm when explicitly unclear
 	}
+	// Guard the ack: it's spoken, so drop anything long/rambly (weak models
+	// sometimes over-produce) rather than cut it mid-word, and strip a trailing
+	// question mark (an ack is a lead-in, not a question).
+	t.Ack = strings.TrimSpace(t.Ack)
+	if len(t.Ack) > 120 {
+		t.Ack = ""
+	}
+	t.Ack = strings.TrimRight(t.Ack, " ?")
 	return t
 }
 
@@ -218,8 +249,10 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"clarified (e.g. 'what was the question?', 'can you repeat that?', 'I didn't catch it', " +
 	"'I don't understand').\n" +
 	"- 'off_topic': the reply is real, readable speech but about something ENTIRELY " +
-	"UNRELATED to the question (e.g. asking the time, the weather, or an aside directed " +
-	"at someone else like 'hold on, not you').\n" +
+	"UNRELATED to the question — e.g. asking the time or the weather, an aside directed " +
+	"at someone else ('hold on, not you'), or chatting about an unrelated subject like " +
+	"last night's game or sports. This holds EVEN when it's phrased as a statement, not a " +
+	"question — an unrelated statement is still off_topic, not an 'answer'.\n" +
 	"- 'unintelligible': ONLY when there are no real words at all — pure noise, empty, " +
 	"transcription artifacts like '(buzzing)', or random letters. If you can read actual " +
 	"words that form any statement or suggestion, it is NOT unintelligible.\n" +
@@ -240,7 +273,20 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"'the price is a little salty', 'make publicity in the television'), a parseable-but-" +
 	"garbled transcript, or an ambiguous reference. Be CONSERVATIVE: only mark 'unclear' when " +
 	"you genuinely couldn't be sure what they meant; otherwise 'clear'.\n" +
-	"Respond ONLY as JSON with intent, sufficient, and clarity."
+	"ACK: a SHORT, warm, spoken lead-in the agent will say right before the next question — " +
+	"it makes the survey feel like a conversation, not a form. Rules:\n" +
+	"- Keep it to a few words, one short phrase. It is a lead-in, NOT a question (never end with '?').\n" +
+	"- Make it SPECIFIC to what they actually said — reflect their point back ('Comfier seating, got it.', " +
+	"'Love that — something tropical.'). A generic 'Got it, thanks!' repeated every turn feels robotic, so " +
+	"vary it and tie it to their words.\n" +
+	"- For an 'off_topic' reply: lightly acknowledge the aside and pivot back warmly ('Ha, no worries —', " +
+	"'No problem —', 'Right, anyway —'), WITHOUT engaging the tangent and WITHOUT promising to discuss it " +
+	"later. The agent re-asks the question itself right after.\n" +
+	"- Leave ack EMPTY (\"\") for 'wants_stop', 'repeat', 'unintelligible', and for any 'unclear' answer " +
+	"(those get their own handling — no lead-in).\n" +
+	"- NEVER invent facts about the product or the respondent. If nothing specific fits, a brief neutral " +
+	"nod ('Got it.') is fine, but prefer specificity.\n" +
+	"Respond ONLY as JSON with intent, sufficient, clarity, and ack."
 
 // ClassifyTurn (Ollama backend) reads a respondent reply in the context of the
 // current question. Runs at temperature 0 so the label is stable/repeatable.

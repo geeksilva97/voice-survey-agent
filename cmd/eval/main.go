@@ -29,6 +29,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -72,6 +73,9 @@ type report struct {
 	ansOK     int
 	clarTotal int // cases with an expected clarity label
 	clarOK    int // clarity classified correctly
+	ackTotal  int // cases where an ack is expected (judged, ungated)
+	ackGood   int // acks the judge rated good
+	ackBad    []ackFail
 	errs      int // per-case classify errors
 	failures  []failure
 	elapsed   time.Duration
@@ -84,9 +88,17 @@ type failure struct {
 	clarityMiss bool // intent correct but clarity axis wrong
 }
 
+// ackFail is one acknowledgment the judge rated poor (for the detail block).
+type ackFail struct {
+	reply  string
+	ack    string
+	reason string
+}
+
 func (r report) acc() float64      { return ratio(r.correct, r.total) }
 func (r report) ansRate() float64  { return ratio(r.ansOK, r.ansTotal) }
 func (r report) clarRate() float64 { return ratio(r.clarOK, r.clarTotal) }
+func (r report) ackRate() float64  { return ratio(r.ackGood, r.ackTotal) }
 func (r report) recall(k llm.Intent) float64 {
 	tp := r.cm[k][k]
 	support := 0
@@ -105,12 +117,27 @@ func main() {
 	minAcc := flag.Float64("min-acc", 0.90, "minimum overall intent accuracy to pass")
 	minAns := flag.Float64("min-answer", 0.95, "minimum valid-answer acceptance rate to pass")
 	pepitaEnv := flag.String("pepita-env", llm.DefaultAnthropicEnvFile(), "path to pepita .env for ANTHROPIC_API_KEY")
+	judgeModel := flag.String("judge", "claude-sonnet-5", "model that judges acknowledgment quality (ungated); empty to skip")
 	flag.Parse()
 
 	names := splitCSV(*models)
 	if len(names) == 0 {
 		fmt.Fprintln(os.Stderr, "no models given")
 		os.Exit(2)
+	}
+
+	// The ack judge is a single fixed model used across every evaluated model, so
+	// the ack-quality metric is comparable. It's ungated and best-effort: if it
+	// can't be built (e.g. no key, offline), we just skip ack scoring.
+	var judge llm.Completer
+	if jm := strings.TrimSpace(*judgeModel); jm != "" {
+		j, err := buildCompleter(jm, *pepitaEnv)
+		if err != nil {
+			fmt.Printf("(ack judge %q unavailable, skipping ack scoring: %v)\n", jm, err)
+		} else {
+			judge = j
+			fmt.Printf("ack judge: %s\n", jm)
+		}
 	}
 
 	fmt.Printf("Intent-classification eval — cases=%d concurrency=%d\nmodels: %s\n\n",
@@ -124,7 +151,7 @@ func main() {
 			reports = append(reports, report{model: name, buildErr: err})
 			continue
 		}
-		rep := evaluate(name, cl, *conc)
+		rep := evaluate(name, cl, *conc, judge)
 		printReport(rep)
 		reports = append(reports, rep)
 	}
@@ -147,8 +174,9 @@ func main() {
 	os.Exit(1)
 }
 
-// evaluate runs the whole dataset through one classifier with a worker pool.
-func evaluate(name string, cl llm.Classifier, conc int) report {
+// evaluate runs the whole dataset through one classifier with a worker pool,
+// then (if a judge is given) scores the acknowledgments the classifier produced.
+func evaluate(name string, cl llm.Classifier, conc int, judge llm.Completer) report {
 	start := time.Now()
 	type outcome struct {
 		c   evalCase
@@ -211,7 +239,49 @@ func evaluate(name string, cl llm.Classifier, conc int) report {
 			}
 		}
 	}
+
+	// Acknowledgment quality (ungated). For every case where the product would
+	// SPEAK an ack — a clear answer or an off-topic steer-back — ask the judge
+	// whether the ack the classifier produced is good. Judged on ground-truth
+	// expectation so it measures "does this model give good acks where we want
+	// them", independent of whether its own intent/clarity call was right.
+	if judge != nil {
+		var mu sync.Mutex
+		var jwg sync.WaitGroup
+		for _, o := range outcomes {
+			if o.err != nil || !ackExpected(o.c) {
+				continue
+			}
+			jwg.Add(1)
+			sem <- struct{}{}
+			go func(c evalCase, ack string) {
+				defer jwg.Done()
+				defer func() { <-sem }()
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				good, reason, err := judgeAck(ctx, judge, c, ack)
+				if err != nil {
+					return // best-effort: a judge glitch doesn't count against the model
+				}
+				mu.Lock()
+				rep.ackTotal++
+				if good {
+					rep.ackGood++
+				} else {
+					rep.ackBad = append(rep.ackBad, ackFail{reply: c.reply, ack: ack, reason: reason})
+				}
+				mu.Unlock()
+			}(o.c, o.got.Ack)
+		}
+		jwg.Wait()
+	}
 	return rep
+}
+
+// ackExpected reports whether the agent would speak an acknowledgment for this
+// case: a clear answer (reflect-back) or an off-topic reply (warm steer-back).
+func ackExpected(c evalCase) bool {
+	return (c.want == llm.IntentAnswer && c.clarity == clear) || c.want == llm.IntentOffTopic
 }
 
 func printReport(r report) {
@@ -264,13 +334,25 @@ func printReport(r report) {
 				short(f.c.want), short(f.got.Intent), f.got.Sufficient, f.c.reply, note)
 		}
 	}
+
+	// Acknowledgment quality (ungated) — a sample of the acks the judge disliked.
+	if r.ackTotal > 0 {
+		fmt.Printf("ack quality: %d/%d good (%.1f%%)\n", r.ackGood, r.ackTotal, 100*r.ackRate())
+		for i, a := range r.ackBad {
+			if i >= 6 {
+				fmt.Printf("  …and %d more\n", len(r.ackBad)-6)
+				break
+			}
+			fmt.Printf("  bad ack %q  (%s)  R:%q\n", a.ack, a.reason, a.reply)
+		}
+	}
 	fmt.Println()
 }
 
 func printMatrix(reports []report, minAcc, minAns float64) {
-	fmt.Println("=== comparison matrix (acc/ans✓/clar = headline; per-intent = recall) ===")
-	fmt.Printf("%-20s %7s %7s %7s %7s %7s %7s %7s %7s %8s\n",
-		"model", "acc", "ans✓", "clar", "answer", "stop", "repeat", "offtop", "unintl", "time")
+	fmt.Println("=== comparison matrix (acc/ans✓/clar/ack = headline; per-intent = recall) ===")
+	fmt.Printf("%-20s %7s %7s %7s %7s %7s %7s %7s %7s %7s %8s\n",
+		"model", "acc", "ans✓", "clar", "ack", "answer", "stop", "repeat", "offtop", "unintl", "time")
 	for i, r := range reports {
 		tag := ""
 		if i == 0 {
@@ -284,15 +366,19 @@ func printMatrix(reports []report, minAcc, minAns float64) {
 		if i == 0 && !(r.acc() >= minAcc && r.ansRate() >= minAns) {
 			status = "FAIL"
 		}
-		fmt.Printf("%-20s %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %7s  %s %s\n",
+		ackCell := "      —"
+		if r.ackTotal > 0 {
+			ackCell = fmt.Sprintf("%6.1f%%", 100*r.ackRate())
+		}
+		fmt.Printf("%-20s %6.1f%% %6.1f%% %6.1f%% %7s %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %7s  %s %s\n",
 			trunc20(r.model),
-			100*r.acc(), 100*r.ansRate(), 100*r.clarRate(),
+			100*r.acc(), 100*r.ansRate(), 100*r.clarRate(), ackCell,
 			100*r.recall(llm.IntentAnswer), 100*r.recall(llm.IntentWantsStop),
 			100*r.recall(llm.IntentRepeat), 100*r.recall(llm.IntentOffTopic),
 			100*r.recall(llm.IntentUnintellig),
 			r.elapsed.Round(time.Millisecond), status, tag)
 	}
-	fmt.Printf("\nthresholds: acc>=%.0f%%, answer-accept>=%.0f%%  (gate model only)\n",
+	fmt.Printf("\nthresholds: acc>=%.0f%%, answer-accept>=%.0f%%  (gate model only; clar/ack ungated)\n",
 		100*minAcc, 100*minAns)
 }
 
@@ -307,6 +393,65 @@ func buildClassifier(name, pepitaEnv string) (llm.Classifier, error) {
 		}
 	}
 	return llm.NewClassifier(name, key)
+}
+
+func buildCompleter(name, pepitaEnv string) (llm.Completer, error) {
+	var key string
+	if llm.IsAnthropicModel(name) {
+		var err error
+		if key, err = llm.LoadAnthropicKey(pepitaEnv); err != nil {
+			return nil, err
+		}
+	}
+	return llm.NewCompleter(name, key)
+}
+
+// ---- acknowledgment judge (ungated, generative score) ----
+
+const ackJudgeSystem = "You grade a single one-line acknowledgment produced by a survey " +
+	"voice-agent. Right before asking its next question, the agent says this short line so it " +
+	"sounds human instead of like a form. Given the QUESTION the respondent just answered, their " +
+	"REPLY, whether the reply was OFF-TOPIC, and the agent's ACK, decide if the ack is good.\n" +
+	"A GOOD ack is: short (a phrase, not a full sentence, never a question), natural and spoken, " +
+	"and SPECIFIC to what the respondent said. For a normal answer it briefly reflects their point " +
+	"back. For an OFF-TOPIC reply it lightly acknowledges the aside and steers back WITHOUT engaging " +
+	"the tangent.\n" +
+	"A BAD ack is: empty when one is expected, generic/templated (a bare 'Got it, thanks' with no " +
+	"specificity), phrased as a question, rude or dismissive, too long/rambly, or — for an off-topic " +
+	"reply — actually engaging the tangent.\n" +
+	`Respond ONLY as JSON: {"good": true|false, "reason": "a few words"}.`
+
+// judgeAck asks the judge model whether one produced ack is good.
+func judgeAck(ctx context.Context, judge llm.Completer, c evalCase, ack string) (bool, string, error) {
+	user := fmt.Sprintf("QUESTION: %s\nREPLY: %s\nOFF-TOPIC: %v\nACK: %q",
+		c.q, c.reply, c.want == llm.IntentOffTopic, ack)
+	raw, err := judge.Complete(ctx, ackJudgeSystem, user)
+	if err != nil {
+		return false, "", err
+	}
+	good, reason, ok := parseJudge(raw)
+	if !ok {
+		return false, "", fmt.Errorf("unparseable judge output: %q", trunc20(raw))
+	}
+	return good, reason, nil
+}
+
+// parseJudge isolates the first JSON object and reads {good, reason}.
+func parseJudge(raw string) (good bool, reason string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if i := strings.IndexByte(raw, '{'); i >= 0 {
+		if j := strings.LastIndexByte(raw, '}'); j > i {
+			raw = raw[i : j+1]
+		}
+	}
+	var v struct {
+		Good   bool   `json:"good"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return false, "", false
+	}
+	return v.Good, v.Reason, true
 }
 
 // ---- small helpers ----

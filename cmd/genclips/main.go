@@ -33,6 +33,9 @@ func main() {
 		"calque.wav": "The candles are very perfumed and I liking too much, but honestly the price is a little salty for me.",
 		// A bare affirmation to resolve a repair turn (keeps the original answer).
 		"yes.wav": "Yes, exactly, that's what I meant.",
+		// An off-topic aside (sports) — should classify off_topic so the agent
+		// acknowledges warmly and steers back to the question (ack layer QA).
+		"offtopic.wav": "Hey, did you catch that World Cup game last night?",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)

@@ -13,7 +13,7 @@
 // Plain DevTools console: paste, then reload once so it wraps getUserMedia early.
 (() => {
   const log = (...a) => console.log('[fakemic]', ...a);
-  const clipNames = ['ans0.wav', 'ans1.wav', 'ans2.wav', 'bail.wav', 'calque.wav', 'yes.wav'];
+  const clipNames = ['ans0.wav', 'ans1.wav', 'ans2.wav', 'bail.wav', 'calque.wav', 'yes.wav', 'offtopic.wav'];
   const clips = {};
   let ac, dest;
   window.__fakemicReady = false;
