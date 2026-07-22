@@ -80,6 +80,26 @@ func TestFollowUpPrompt(t *testing.T) {
 	}
 }
 
+// TestSurveyOpening: after the greeting, the first turn leads with the caring
+// line, adds a brief framing bridge (no second "hi"), and ends with the question.
+func TestSurveyOpening(t *testing.T) {
+	q := "How do you like the scent?"
+	got := surveyOpening("Glad to hear!", "our candles", q)
+	if !strings.HasPrefix(got, "Glad to hear!") {
+		t.Errorf("opening should lead with the caring line; got %q", got)
+	}
+	if !strings.Contains(got, "our candles") || !strings.HasSuffix(got, q) {
+		t.Errorf("opening should frame the product and end with the question; got %q", got)
+	}
+	if strings.Contains(strings.ToLower(got), "hi ") || strings.Contains(got, "Hello") {
+		t.Errorf("opening must not greet again after the greeting turn; got %q", got)
+	}
+	// No caring lead (empty ack) → still a clean framing + question, no dangling space.
+	if got := surveyOpening("", "candles", q); !strings.HasPrefix(got, "Let's jump in") {
+		t.Errorf("empty lead should start with the bridge; got %q", got)
+	}
+}
+
 // TestHelpPrompt: a needs-help turn leads with the classifier's reassurance (or
 // a neutral fallback) and always re-poses the question so the respondent gets a
 // real second shot at answering.

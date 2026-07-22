@@ -144,6 +144,29 @@ Anthropic models read the key from `$ANTHROPIC_API_KEY`, else `-anthropic-env`
 (defaults to pepita's `.env`). Ollama/`:cloud` models need no key. Every turn
 now costs a round-trip to that model, so expect a little more latency per reply.
 
+### Greeting pre-layer (a human hello before the survey)
+
+Sessions open with a short small-talk exchange before any question — *"Hey,
+thanks for taking a moment! Before we dive in — how's your day going so far?"* —
+so the agent says hello like a person, not a form. The respondent's reply is read
+with the **existing** turn classifier (one call, no new prompt, no extra
+latency): if they bail ("actually I don't have time") the session ends
+gracefully; otherwise the classifier's `ack` becomes a warm, specific caring line
+(*"Glad to hear!"*, *"Ah, sorry to hear that."*) that leads straight into the
+survey (caring line + a brief framing bridge + Q1, one clip — no second "hi").
+
+It's a SINGLE exchange — the agent never loops on the greeting, so the survey
+starts promptly. Silence or a cough during the greeting falls through the normal
+silence backstop / non-speech guard. Toggle with `-greeting` (default on); off
+restores the LLM-authored intro opening. `surveyOpening` is unit tested
+(`TestSurveyOpening`). Caring-line quality tracks model strength (like acks): on
+the 3B the ack may be empty, so it opens with the neutral-warm fallback.
+
+```bash
+go run ./cmd/server                  # greeting on (default)
+go run ./cmd/server -greeting=false  # straight into the intro + first question
+```
+
 ### "Needs help" — when the respondent doesn't know how to answer
 
 Some replies aren't answers, refusals, or off-topic asides — they're the person

@@ -40,6 +40,9 @@ func main() {
 		// the agent for guidance. Should classify needs_help so the agent reassures
 		// + hints how to answer, then re-poses the question (needs-help layer QA).
 		"unsure.wav": "Hmm, I'm not really sure how to answer that. What are you looking for?",
+		// A reply to the opening "how's your day" small-talk — feeds the greeting
+		// pre-layer QA (agent should respond warmly, then start the survey).
+		"day.wav": "Oh, pretty good, thanks for asking! A bit of a busy morning, but I can't complain.",
 	}
 	for name, text := range clips {
 		wav, err := eng.Synthesize(text)
