@@ -30,6 +30,7 @@ func main() {
 	insightModel := flag.String("insight-model", "gemma4:latest", "model for the results-insight scoring pass; Ollama (offline) or an Anthropic model like claude-sonnet-5")
 	greeting := flag.Bool("greeting", true, "open each session with a short 'how's your day' greeting before the survey")
 	agentName := flag.String("agent-name", "Ava", "the voice agent's name (used in the spoken greetings)")
+	pacing := flag.Bool("pacing", true, "deliver each question as two beats — a short acknowledgment, a brief pause, then the question — instead of one breath")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
 	flag.Parse()
 
@@ -91,7 +92,7 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Greeting: *greeting, AgentName: *agentName}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Greeting: *greeting, AgentName: *agentName, Pacing: *pacing}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))

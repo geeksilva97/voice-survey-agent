@@ -94,6 +94,19 @@ func (e *Engine) Synthesize(text string) ([]byte, error) {
 	return encodeWAV(audio.Samples, audio.SampleRate), nil
 }
 
+// Silence returns a WAV of ms milliseconds of silence at the TTS sample rate.
+// It's used to insert a deliberate pause between two spoken beats (an
+// acknowledgment, then the question): Kokoro has no SSML, so the gap is baked
+// into the audio stream as a silent buffer the client plays like any other,
+// keeping the whole turn a single continuous playback.
+func (e *Engine) Silence(ms int) []byte {
+	if ms < 0 {
+		ms = 0
+	}
+	n := e.ttsSampleRate * ms / 1000
+	return encodeWAV(make([]float32, n), e.ttsSampleRate)
+}
+
 // Transcribe decodes mono PCM16 samples (any sample rate; sherpa resamples
 // internally) into text. Pass the sample rate the browser captured at (16k).
 func (e *Engine) Transcribe(pcm16 []byte, sampleRate int) string {
