@@ -21,7 +21,9 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -55,6 +57,12 @@ type Handler struct {
 	Speech *speech.Engine
 	LLM    llm.Classifier
 	Closer llm.Completer
+	// Greeting opens each session with a short "how's your day" exchange before
+	// the survey (a warm human hello), reusing the classifier to read the reply.
+	Greeting bool
+	// AgentName is the voice agent's name, used in the fixed fallback greeting
+	// when the poll has no LLM-authored greeting variants.
+	AgentName string
 }
 
 // outMsg is a server->client control frame.
@@ -115,9 +123,10 @@ type conversation struct {
 	c    *websocket.Conn
 	sv   *survey.Survey
 
-	speaking bool // true while we expect the client to be playing audio
-	strikes  int  // consecutive silence nudges
-	reasks   int  // times we've re-read the current question
+	speaking   bool // true while we expect the client to be playing audio
+	strikes    int  // consecutive silence nudges
+	reasks     int  // times we've re-read the current question
+	inGreeting bool // awaiting the reply to the opening "how's your day" small-talk
 
 	// Conversational repair: when an answer is understood-but-unclear (calque /
 	// heavy ESL / ambiguous), the agent confirms ONCE before advancing. Capped
@@ -131,8 +140,13 @@ func (cv *conversation) run() {
 	events := make(chan event, 8)
 	go cv.readLoop(events)
 
-	// Opening line + first question.
-	cv.greetAndAskFirst()
+	// Opening. With the greeting pre-layer on, a short "how's your day" exchange
+	// comes first; otherwise we open straight into the intro + first question.
+	if cv.h.Greeting {
+		cv.openGreeting()
+	} else {
+		cv.greetAndAskFirst()
+	}
 
 	timer := time.NewTimer(silenceWindow)
 	timer.Stop() // only armed while listening
@@ -218,6 +232,11 @@ func (cv *conversation) run() {
 func (cv *conversation) handleUtterance(pcm []byte) bool {
 	text := cv.h.Speech.Transcribe(pcm, inputSampleRate)
 	cv.send(outMsg{Type: "transcript", Text: text})
+
+	// The opening small-talk reply is handled separately — it's not a survey slot.
+	if cv.inGreeting {
+		return cv.handleGreeting(text)
+	}
 
 	q, ok := cv.sv.Current()
 	if !ok {
@@ -480,6 +499,99 @@ func (cv *conversation) greetAndAskFirst() {
 	// missing. TTS is streamed sentence-by-sentence, so the first words arrive fast.
 	opening := withLead(introLine(cv.poll.Intro, cv.poll.Product), q.Text)
 	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
+}
+
+// greetingQuestion is the small-talk opener the agent asks before the survey.
+// It's kept short — a normal human hello — and doubles as the "question" context
+// we hand the classifier when reading the reply.
+const greetingQuestion = "How's your day going so far?"
+
+// openGreeting speaks the warm hello (the agent introduces herself by name, says
+// she'll ask a few quick questions about the product, and asks how the day is
+// going) and waits for the reply. Touches no survey state.
+func (cv *conversation) openGreeting() {
+	cv.inGreeting = true
+	line := greetingLine(cv.h.AgentName, cv.poll.Product)
+	cv.emit(outMsg{Type: "agent_say", Text: line, Kind: "greeting"}, line)
+}
+
+// greetingTemplates are curated spoken openers. Each introduces the agent by
+// name, frames the survey (a few quick questions about the product), and ends by
+// asking how the person's day is going. We use hand-written templates rather
+// than LLM generation because the offline question-gen model (3B) proved too
+// weak to self-introduce reliably (it addressed the respondent by the agent's
+// name). %[1]s = agent name, %[2]s = product. Picked at random per session so
+// the opener varies. Keep every variant ending on a "how are you" so the reply
+// is a wellbeing answer the classifier can read.
+var greetingTemplates = []string{
+	"Hi there, I'm %[1]s! I've got just a few quick questions about %[2]s — but first, how's your day going?",
+	"Hey, %[1]s here! Before we get into a few quick questions about %[2]s, how are you doing today?",
+	"Hello! My name's %[1]s, and I'll ask you a handful of quick questions about %[2]s. But tell me first — how's your day treating you?",
+	"Hi! I'm %[1]s. In a moment I'll ask a few quick questions about %[2]s, but first — how are you today?",
+}
+
+// greetingLine fills a random greeting template with the agent name and product.
+func greetingLine(name, product string) string {
+	if name = strings.TrimSpace(name); name == "" {
+		name = "Ava"
+	}
+	return fmt.Sprintf(greetingTemplates[rand.Intn(len(greetingTemplates))], name, strings.TrimSpace(product))
+}
+
+// handleGreeting reads the reply to the opening small-talk. It reuses the turn
+// classifier (one call, no extra latency) for two things: catch an early bail,
+// and get a warm, SPECIFIC caring line (the ack) to open the survey with. It's a
+// single exchange — we never loop on the greeting, so the survey starts promptly.
+func (cv *conversation) handleGreeting(text string) bool {
+	cv.inGreeting = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	turn, err := cv.h.LLM.ClassifyTurn(ctx, greetingQuestion, text)
+	if err != nil {
+		log.Printf("greeting classify error: %v", err)
+		turn = llm.Turn{Intent: llm.IntentAnswer}
+	}
+
+	// They can bail right at hello ("actually I don't have time").
+	if turn.Intent == llm.IntentWantsStop {
+		cv.sv.Bail()
+		cv.persist()
+		cv.speak("No problem at all — thanks so much for the time you gave us. Take care!", "closing")
+		cv.finalize(survey.Bailed)
+		return true
+	}
+
+	// Reflect their day back warmly, then move into the survey. Fall back to a
+	// neutral-warm line when the model gave no ack (weaker models under-produce).
+	care := strings.TrimSpace(turn.Ack)
+	if care == "" {
+		care = "Thanks — glad you're here."
+	}
+	return cv.startSurvey(care)
+}
+
+// startSurvey speaks the first question, led by the caring line from the
+// greeting and a short framing bridge (no second "hi" — we already greeted).
+func (cv *conversation) startSurvey(lead string) bool {
+	q, ok := cv.sv.Current()
+	if !ok {
+		return cv.finishCompleted(lead)
+	}
+	cv.sv.MarkAsked()
+	idx, total := cv.sv.Progress()
+	opening := surveyOpening(lead, q.Text)
+	cv.emit(outMsg{Type: "agent_say", Text: opening, Kind: "question", Index: idx, Total: total}, opening)
+	return false
+}
+
+// surveyOpening composes the post-greeting first turn: caring lead + a brief
+// bridge + the first question, all in one clip (half-duplex). The greeting
+// already named the product and introduced the agent, so the bridge only adds a
+// light reassurance and hands off — no second greeting or product restatement.
+func surveyOpening(lead, question string) string {
+	bridge := "Alright — no wrong answers here, just your honest take. Here's the first:"
+	return withLead(lead, withLead(bridge, question))
 }
 
 // ---- transport helpers ----
