@@ -4,14 +4,12 @@ Research brief behind the **two-beat delivery** feature (`-pacing`): after a
 respondent answers, the agent says a short acknowledgment, pauses a beat, *then*
 asks the next question — instead of reading "ack + question" in one breath.
 
-The motivation was a side-by-side with a competitor bot ("Emma") whose turns felt
-noticeably more fluid. On inspection the fluidity came down to **pacing** — she
-split a turn into acknowledgment and question as two beats with a pause between —
-not smarter content (our acknowledgments were actually *more* specific). Notably,
-that same competitor **failed a clear bail** ("i gotta go sorry" → she asked the
-next question anyway), which is exactly the end-of-conversation detection our
-deterministic state machine gets right. So the goal was to borrow the pacing
-*without* giving up the deterministic spine.
+The motivation: our agent delivered the acknowledgment and the next question in
+one breath, which read as a block rather than a conversation. The fix turned out
+to be **pacing**, not content — our acknowledgments were already specific; what
+was missing was splitting a turn into two beats (ack, then question) with a short
+pause between, the way a person naturally does. The goal was to add that pacing
+*without* giving up the deterministic state machine that owns the ending.
 
 Three research threads: the conversational science, what production frameworks
 actually ship, and how to implement it over our half-duplex pipeline.
