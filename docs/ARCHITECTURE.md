@@ -79,7 +79,77 @@ immediately instead of waiting for the whole reply to synthesize.
 
 ---
 
-## 3. How it knows when to end  ⭐
+## 3. Every utterance goes through intent analysis
+
+There is exactly **one** way into the conversation logic: whatever the respondent
+says is transcribed, labeled by the classifier, and then routed by Go code. The
+greeting, the "ready?" beat, and every question slot all funnel through the same
+`ClassifyTurn` with the same prompt — so "actually, I don't have time" ends the
+call at hello just as reliably as it does on question four.
+
+```mermaid
+flowchart TD
+  UTT(["respondent utterance<br/>(PCM16 16k, on VAD speech-end)"]) --> STT["Whisper STT → text"]
+  STT --> PRE{"non-speech artifact?<br/>'(coughing)', '[inaudible]'"}
+  PRE -- yes --> FORCED["forced 'unintelligible'<br/>(deterministic, no LLM call)"]
+  PRE -- no --> CTX{"conversation<br/>context"}
+
+  CTX -- "opening small-talk" --> CLS
+  CTX -- "'ready?' beat" --> CLS
+  CTX -- "current question slot" --> CLS
+
+  CLS["🧠 ClassifyTurn(question, reply)<br/>one LLM call · temp 0 · JSON schema"] --> TURN
+  FORCED --> TURN["{intent, sufficient, clarity, ack}"]
+
+  TURN --> ROUTER{"route on intent<br/>(Go, not the LLM)"}
+  ROUTER -- "wants_stop" --> R1["Bail → closing line → END"]
+  ROUTER -- "repeat" --> R2["re-read the question verbatim"]
+  ROUTER -- "needs_help" --> R3["reassure with 'ack' + re-pose"]
+  ROUTER -- "answer + sufficient" --> R4{"clarity?"}
+  ROUTER -- "off_topic · unintelligible ·<br/>answer but insufficient" --> R5{"follow-up<br/>budget left?"}
+
+  R4 -- "clear" --> REC["RecordAnswer → advance cursor"]
+  R4 -- "unclear" --> REPAIR["confirm once ('did I get that right?')"]
+  R5 -- "yes" --> PROBE["one clarifying probe"]
+  R5 -- "no" --> CAP["capture or skip → advance cursor"]
+
+  REC --> NEXT(["next agent turn / end check"])
+  CAP --> NEXT
+  R2 --> LISTEN(["listen again"])
+  R3 --> LISTEN
+  REPAIR --> LISTEN
+  PROBE --> LISTEN
+```
+
+The classifier reads the turn on **two axes**: `intent` (what they're doing) and
+`clarity` (whether we pinned down the content). Clarity is what triggers a light
+repair on a valid-but-hard-to-parse answer instead of throwing it away.
+
+| Intent | Agent does | Slot cursor |
+|---|---|---|
+| `answer` + sufficient | acknowledge and move on (or confirm once if `unclear`) | advances |
+| `answer`, insufficient | one gentle probe, then capture what it got | advances after the probe |
+| `wants_stop` | closing line, hang up | — (ends) |
+| `repeat` | re-read the question as-is | stays |
+| `needs_help` | reassure + hint how to answer, re-pose the question | stays |
+| `off_topic` | steer back once, then **skip** (never fabricate an answer) | advances after the probe |
+| `unintelligible` | same as off-topic — probe once, then skip | advances after the probe |
+
+Three properties make this safe to run unattended:
+
+- **The LLM labels; it never acts.** Every branch above is a Go `if` in
+  `internal/ws`. There is no tool the model can call to hang up, skip a
+  question, or re-ask — see [`RESEARCH.md`](RESEARCH.md) for why that matters.
+- **It fails open.** A classifier timeout or unparseable JSON degrades to
+  `{answer, sufficient, clear}`, so a model glitch advances the survey instead
+  of stalling it.
+- **Every "stay put" branch is capped.** `repeat` and `needs_help` share a
+  re-ask budget, probes are capped per question, and a repair happens at most
+  once per slot — so no intent can hold the conversation on one question.
+
+---
+
+## 4. How it knows when to end  ⭐
 
 The core design decision (validated by the research in
 [`RESEARCH.md`](RESEARCH.md)): **an LLM cannot reliably feel when a scripted
@@ -149,7 +219,7 @@ stateDiagram-v2
 
 ---
 
-## 4. WebSocket protocol
+## 5. WebSocket protocol
 
 Text frames = JSON control; binary frames = audio (PCM16 in, WAV chunks out).
 
@@ -179,7 +249,7 @@ reloading `/poll/<id>` re-takes it (used by the Restart button).
 
 ---
 
-## 5. Tuning knobs
+## 6. Tuning knobs
 
 | Knob | Where | Default | Effect |
 |---|---|---|---|

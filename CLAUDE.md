@@ -19,7 +19,7 @@ are done, and the LLM only classifies each turn on the way there.
 
 One happy path, three early exits: **completed** (all slots filled), **bailed**
 (user wants to stop), **silence** (timeout backstop). See `docs/RESEARCH.md` for
-the full reasoning and `docs/ARCHITECTURE.md §3` for the implementation.
+the full reasoning and `docs/ARCHITECTURE.md §4` for the implementation.
 
 ---
 
@@ -120,7 +120,8 @@ ending logic all run for real; only the *input device* (mic) is faked.
 
 - [README.md](README.md) — quick start, stack, "what's verified and how".
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, one turn end-to-end,
-  **how it ends** (⭐ §3), conversation states, WebSocket protocol, tuning knobs.
+  **every turn goes through intent analysis** (§3), **how it ends** (⭐ §4),
+  conversation states, WebSocket protocol, tuning knobs.
 - [docs/RESEARCH.md](docs/RESEARCH.md) — the thesis: why ending is a state-machine
   problem, the `end_call` action, deterministic backstops, script-done vs.
   bail-early, end-of-turn ≠ end-of-conversation, recommended stack.
