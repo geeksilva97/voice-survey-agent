@@ -25,6 +25,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode"
 
 	"voicesurvey/internal/llm"
 	"voicesurvey/internal/survey"
@@ -315,8 +316,14 @@ func (cv *conversation) agentExec(c llm.Block) (llm.Block, *terminal) {
 		if err := json.Unmarshal(c.Input, &in); err != nil {
 			return res("could not parse arguments: "+err.Error(), true), nil
 		}
-		if strings.TrimSpace(in.Text) == "" {
-			return res("text was empty — say something or call another tool", true), nil
+		// Guard against a degenerate `say`. Observed in the A/B: the model once
+		// called say with a lone `"` and the agent dutifully synthesized a stray
+		// quote mark at the respondent. Anything with no letters or digits is not
+		// speech, so refuse it and let the model try again — the classifier path
+		// gets this free, because it never speaks model output that isn't either a
+		// survey question or a length-checked ack.
+		if !hasSpeech(in.Text) {
+			return res("that isn't speakable text — call say with a real sentence, or use another tool", true), nil
 		}
 		return res("said; now listening for their reply", false),
 			&terminal{kind: "say", text: in.Text, toolName: c.Name}
@@ -458,3 +465,14 @@ func (cv *conversation) qaTool(name string) {
 }
 
 func quote(s string) string { return `"` + strings.TrimSpace(s) + `"` }
+
+// hasSpeech reports whether a string contains anything a voice could actually
+// say — at least one letter or digit. Punctuation alone is not speech.
+func hasSpeech(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
+}

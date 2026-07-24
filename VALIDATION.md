@@ -393,6 +393,34 @@ Last run (`claude-sonnet-5`, 5-question candle survey):
 - `survey.Fill(idx, answer)` (multi-slot fill by index) is unit-tested in
   `internal/survey/survey_test.go` — `TestFillByIndexAdvancesCursor`.
 
+**Persona A/B** (`scripts/browser-e2e/playwright/compare.spec.js`, 4 personas ×
+both drivers, `claude-sonnet-5` both sides, 8/8 runs terminal, no test errors):
+
+- **Endings: 4/4 correct on both paths**, including the rusher's bail. Agent
+  steps/turn 1.20–1.40, avg model call 1.97–2.96s, 9.6k–15.0k input tokens per
+  session (the classifier's prompt is flat at ~1.7k).
+- **Fluidity: a tie on the three easy personas** (1.00 respondent turns per
+  question on both) and **worse for the agent on `confused`** — asked *"What
+  specifically do you mean by smell and burn time?"* it replied *"Great, let's
+  start simple."* and moved on, where the classifier's `needs_help` fired and
+  reassured + re-posed. Its lower turn count there reflects skipped help, not
+  smoothness.
+- **Two agent-only defects:** a burned turn (said *"Next question for you."* via
+  the terminal `say` and then listened instead of asking), and a synthesized stray
+  `"` from `say("\"")`. A `hasSpeech` guard was added afterwards; the recorded
+  transcripts predate it.
+- **The one agent win is structural:** *"The burn usually lasts about an hour for
+  me. I've got to run."* → `record_answer` + `end_call` in one turn. `llm.Turn`
+  carries one intent and must pick, losing either the answer or the bail.
+- ⚠️ **Paraphrasing confirmed on real answers, not just the degenerate clip** —
+  every slot in all four agent runs stored a third-person rewrite
+  (*"Lavender scent — feels like stepping into a cozy spa"*) instead of the
+  respondent's sentence.
+
+Caveat on method: each run regenerates its own questions (the classifier's
+enthusiast poll had 5, the agent's 3), so wall-clock and total-turn figures are
+question-count artifacts. Only per-question rates within a phase are comparable.
+
 The gate (`./scripts/validate.sh`) still passes **7/7** on this branch: the
 classifier path is untouched, since `Agent == nil` selects it.
 
