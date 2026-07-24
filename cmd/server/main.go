@@ -34,6 +34,7 @@ func main() {
 	pacing := flag.Bool("pacing", true, "deliver each question as two beats — a short acknowledgment, a brief pause, then the question — instead of one breath")
 	qaFlag := flag.Bool("qa", false, "mount the DEV-ONLY persona QA endpoint (POST /api/qa/reply) for browser E2E testing; never enable in production")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
+	agentModel := flag.String("agent-model", "", "EXPERIMENTAL: run the conversation as an agent loop on this Anthropic model (e.g. claude-sonnet-5) instead of the classifier + state machine. The model calls tools and owns termination. Empty = the production classifier path.")
 	flag.Parse()
 
 	log.Println("loading speech models (Kokoro TTS + Whisper STT)…")
@@ -86,6 +87,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("insight completer: %v", err)
 	}
+	// EXPERIMENTAL agent-loop driver. Anthropic-only on purpose: a 3B local model
+	// failing to drive a tool loop would say nothing about the architecture, so the
+	// comparison runs the alternative on a model capable of doing it justice.
+	var agentRunner llm.ToolRunner
+	if *agentModel != "" {
+		if anthropicKey == "" {
+			if anthropicKey, err = llm.LoadAnthropicKey(*anthropicEnv); err != nil {
+				log.Fatalf("agent model %q: %v", *agentModel, err)
+			}
+		}
+		if agentRunner, err = llm.NewToolRunner(*agentModel, anthropicKey); err != nil {
+			log.Fatalf("agent runner: %v", err)
+		}
+		log.Printf("EXPERIMENTAL: agent-loop driver active on %s (classifier path bypassed)", *agentModel)
+	}
+
 	log.Printf("question-gen model: %s | classify model: %s | insight model: %s", *ollamaModel, cm, *insightModel)
 
 	store, err := session.NewStore(*dataDir)
@@ -94,7 +111,7 @@ func main() {
 	}
 
 	app := &app{store: store, llm: llmClient, webDir: *webDir, insightLLM: insightLLM, insightModel: *insightModel}
-	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Greeting: *greeting, AgentName: *agentName, Pacing: *pacing, QA: *qaFlag}
+	wsHandler := &ws.Handler{Store: store, Speech: eng, LLM: classifier, Closer: closer, Agent: agentRunner, Greeting: *greeting, AgentName: *agentName, Pacing: *pacing, QA: *qaFlag}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", app.page("index.html"))

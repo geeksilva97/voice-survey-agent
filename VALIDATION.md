@@ -355,6 +355,47 @@ go run ./cmd/server                       # then open /insights/<a completed pol
 go run ./cmd/server -insight-model claude-sonnet-5   # score with a hosted model
 ```
 
+### EXPERIMENTAL: agent-loop conversation driver (`-agent-model`)
+
+Branch `experiment/agent-loop-tool-calls` only — **not on `main`**. A second
+conversation driver (`internal/ws/agentloop.go`) where the model calls tools
+(`record_answer`, `ask_question`, `say`, `end_call`) instead of returning a label,
+and owns termination. It shares this package's transport with the classifier path,
+so the fork is three lines in `ws.go` choosing the utterance handler. Findings and
+the full A/B write-up: [`docs/AGENT-LOOP-EXPERIMENT.md`](docs/AGENT-LOOP-EXPERIMENT.md).
+
+```bash
+go run ./cmd/server -qa -agent-model claude-sonnet-5     # agent loop
+go run ./cmd/probe -addr localhost:8090 -mode happy      # flow + ending
+go run ./cmd/probe -addr localhost:8090 -mode silent     # silence backstop
+```
+
+Last run (`claude-sonnet-5`, 5-question candle survey):
+
+- **Happy path → `completed`.** 8 model round trips over 7 turns (**1.14/turn** —
+  parallel tool calls batch `record_answer` + `ask_question` into one response),
+  avg **3.0s** per call, 19,959 in / 1,138 out tokens for one session. Input grew
+  1,683 → 3,573 across the survey (the loop accumulates history; the classifier's
+  prompt is flat).
+- **Silence backstop → `silence`**, identical to the classifier path: two strikes,
+  then the wrap-up. `steps=1` and an empty `end_claim` — the model was invoked
+  once for the greeting and never again, because a silent respondent generates
+  nothing to invoke it with. Go's timer ends the call. Confirms the clock cannot
+  move into the model.
+- **`end_call` claims matched the slot tally on every run** — the instrumented
+  `MISMATCH` warning (claims `completed` with slots still open) never fired.
+- ⚠️ **Data fidelity regression.** On the off-topic canned clip the agent marked
+  **5/5 slots `answered`** and wrote its own prose into the answer field
+  (`"No clear answer provided; repeated unrelated quote."`). The classifier path on
+  identical input recorded **3 `skipped` + 2 verbatim**. `internal/insight` and
+  `/results/<id>` cannot distinguish a model's summary of silence from a real
+  answer. This is the experiment's most consequential result.
+- `survey.Fill(idx, answer)` (multi-slot fill by index) is unit-tested in
+  `internal/survey/survey_test.go` — `TestFillByIndexAdvancesCursor`.
+
+The gate (`./scripts/validate.sh`) still passes **7/7** on this branch: the
+classifier path is untouched, since `Agent == nil` selects it.
+
 ### Phase-0 backbone spike (run if speech/models change)
 
 ```bash

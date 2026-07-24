@@ -127,6 +127,11 @@ ending logic all run for real; only the *input device* (mic) is faked.
   bail-early, end-of-turn ≠ end-of-conversation, recommended stack.
 - [docs/PACING-RESEARCH.md](docs/PACING-RESEARCH.md) — turn-gap science and why the
   two-beat pacing (ack → ~400ms silent-PCM pause → question) is built the way it is.
+- [docs/AGENT-LOOP-EXPERIMENT.md](docs/AGENT-LOOP-EXPERIMENT.md) — **branch
+  `experiment/agent-loop-tool-calls` only.** The tool-calling/agent-loop
+  alternative built and measured against the classifier path: what got more
+  fluid, the data-fidelity regression it introduced, and why the silence clock
+  can't move into the model.
 - [docs/BROWSER-QA.md](docs/BROWSER-QA.md) — the fake microphone, the audio
   round-trip, fixed clips vs. LLM personas, the `-qa` endpoint, the `qa_intent`
   channel, and both ways to run it (Chrome MCP + Playwright).

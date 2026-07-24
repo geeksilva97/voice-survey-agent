@@ -57,6 +57,12 @@ type Handler struct {
 	Speech *speech.Engine
 	LLM    llm.Classifier
 	Closer llm.Completer
+	// Agent, when non-nil, switches the conversation to the EXPERIMENTAL agent-loop
+	// driver (agentloop.go): the model calls tools instead of returning a label, and
+	// owns termination via end_call. The transport below is shared with the
+	// classifier path so the two can be compared on one variable. Nil = the
+	// production classifier path.
+	Agent llm.ToolRunner
 	// Greeting opens each session with a short "how's your day" exchange before
 	// the survey (a warm human hello), reusing the classifier to read the reply.
 	Greeting bool
@@ -150,17 +156,25 @@ type conversation struct {
 	confirmed       bool   // already did a repair for the current question
 	awaitingConfirm bool   // last agent turn was a repair; next reply resolves it
 	tentative       string // the unclear answer we're confirming
+
+	// ag is the agent-loop driver's state; non-nil only on the -agent path.
+	ag *agentState
 }
 
 func (cv *conversation) run() {
 	events := make(chan event, 8)
 	go cv.readLoop(events)
 
-	// Opening. With the greeting pre-layer on, a short "how's your day" exchange
-	// comes first; otherwise we open straight into the intro + first question.
-	if cv.h.Greeting {
+	// Opening. On the experimental agent path the model authors the opening itself
+	// (its first act is a tool call). Otherwise: with the greeting pre-layer on, a
+	// short "how's your day" exchange comes first; without it we open straight into
+	// the intro + first question.
+	switch {
+	case cv.h.Agent != nil:
+		cv.agentOpen()
+	case cv.h.Greeting:
 		cv.openGreeting()
-	} else {
+	default:
 		cv.greetAndAskFirst()
 	}
 
@@ -222,7 +236,15 @@ func (cv *conversation) run() {
 			case evUtterance:
 				stopSilence()
 				cv.strikes = 0
-				if done := cv.handleUtterance(ev.pcm); done {
+				// The ONE line that differs between the two conversation drivers.
+				// Everything above and below it — VAD-driven events, the silence
+				// clock, TTS streaming, the protocol — is shared, so an A/B run
+				// isolates the decision layer and nothing else.
+				handle := cv.handleUtterance
+				if cv.h.Agent != nil {
+					handle = cv.handleUtteranceAgent
+				}
+				if done := handle(ev.pcm); done {
 					return
 				}
 				arm()
@@ -501,6 +523,7 @@ func withLead(lead, text string) string {
 func (cv *conversation) endSurveyBySilence() {
 	cv.sv.TimeOut()
 	cv.persist()
+	cv.agentReport() // no-op off the agent path
 	cv.speak("It seems you've stepped away, so I'll wrap up here. Thanks, and take care!", "closing")
 	cv.finalize(survey.Silence)
 }

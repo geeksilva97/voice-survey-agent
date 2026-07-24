@@ -62,6 +62,46 @@ func TestBailAndSilenceEnd(t *testing.T) {
 	}
 }
 
+// Fill is the agent-loop driver's entry point: the model names the slot, so a
+// single reply can close several questions and the cursor must keep up.
+func TestFillByIndexAdvancesCursor(t *testing.T) {
+	s := New([]string{"scent", "price", "packaging"})
+
+	// One reply answers Q1 and Q3 at once — the thing the classifier path cannot
+	// express, because its verdict is always about the current question.
+	if !s.Fill(0, "love the lavender") {
+		t.Fatal("Fill(0) should succeed")
+	}
+	if !s.Fill(2, "nicer boxes") {
+		t.Fatal("Fill(2) should succeed")
+	}
+	// Cursor was on Q1; filling it must move to the next slot that still needs an
+	// answer — Q2 — not to the already-filled Q3.
+	if q, _ := s.Current(); q == nil || q.Text != "price" {
+		t.Fatalf("expected cursor on 'price', got %+v", q)
+	}
+	if s.Questions[2].Status != Answered || s.Questions[2].Answer != "nicer boxes" {
+		t.Fatalf("out-of-order fill did not stick: %+v", s.Questions[2])
+	}
+
+	// An empty answer records honest absence, not a hollow answer.
+	s.Fill(1, "   ")
+	if got := s.Questions[1].Status; got != Skipped {
+		t.Fatalf("empty answer should mark Skipped, got %q", got)
+	}
+	if s.Questions[1].Answer != "" {
+		t.Fatalf("skipped slot should carry no answer, got %q", s.Questions[1].Answer)
+	}
+	if done, reason := s.Done(); !done || reason != Completed {
+		t.Fatalf("all slots resolved should complete, got done=%v reason=%q", done, reason)
+	}
+
+	// Out-of-range is refused rather than panicking — the index comes from a model.
+	if s.Fill(-1, "x") || s.Fill(99, "x") {
+		t.Fatal("out-of-range Fill should return false")
+	}
+}
+
 func TestVolunteeredAnswerFillsOtherSlot(t *testing.T) {
 	s := New([]string{"scent", "price", "packaging"})
 	// While on Q1 (scent), respondent also volunteers a price opinion.

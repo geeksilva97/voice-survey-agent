@@ -129,6 +129,30 @@ func (s *Survey) TryFillOther(match func(question string) (answer string, ok boo
 	return filled
 }
 
+// Fill records an answer for a specific slot by index, regardless of where the
+// cursor is. It exists for the EXPERIMENTAL agent-loop driver, where the model
+// names the slot it's answering — which is what makes a single reply able to fill
+// two questions at once. An empty answer marks the slot Skipped rather than
+// storing a hollow one. The cursor is advanced past any slot this closes.
+func (s *Survey) Fill(idx int, answer string) bool {
+	if idx < 0 || idx >= len(s.Questions) {
+		return false
+	}
+	if a := strings.TrimSpace(answer); a != "" {
+		s.Questions[idx].Answer = a
+		s.Questions[idx].Status = Answered
+	} else {
+		s.Questions[idx].Status = Skipped
+	}
+	// Keep the cursor on a slot that still needs an answer, so the classifier
+	// path's Current() stays meaningful if both drivers ever touch one survey.
+	if idx == s.idx {
+		s.followUps = 0
+		s.advance()
+	}
+	return true
+}
+
 // Bail terminates the survey early because the respondent wants to stop.
 func (s *Survey) Bail() { s.end = Bailed }
 
