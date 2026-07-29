@@ -119,3 +119,18 @@ func TestIsNonSpeechArtifact(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyPromptVersion locks the two properties the fingerprint needs to be
+// useful for attributing score changes to prompt edits: it's stable across calls
+// (same prompt -> same id) and short enough to read in a trace attribute. The
+// value itself is deliberately NOT asserted — it is expected to change whenever
+// the classifier instructions change, which is the whole point.
+func TestClassifyPromptVersion(t *testing.T) {
+	got := ClassifyPromptVersion()
+	if got != ClassifyPromptVersion() {
+		t.Error("ClassifyPromptVersion is not stable across calls")
+	}
+	if len(got) != 12 {
+		t.Errorf("len(ClassifyPromptVersion()) = %d, want 12 (got %q)", len(got), got)
+	}
+}

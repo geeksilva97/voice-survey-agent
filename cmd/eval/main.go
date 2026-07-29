@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/obs"
 )
 
 var intents = []llm.Intent{
@@ -81,6 +82,16 @@ type report struct {
 	errs      int // per-case classify errors
 	failures  []failure
 	elapsed   time.Duration
+	cases     []caseResult // per-case outcomes, kept for the Langfuse export
+}
+
+// caseResult is one case's outcome plus the id of the trace it produced (empty
+// when tracing is off), which is what links it to a Langfuse dataset run item.
+type caseResult struct {
+	c       evalCase
+	got     llm.Turn
+	err     error
+	traceID string
 }
 
 type failure struct {
@@ -120,6 +131,8 @@ func main() {
 	minAns := flag.Float64("min-answer", 0.95, "minimum valid-answer acceptance rate to pass")
 	pepitaEnv := flag.String("pepita-env", llm.DefaultAnthropicEnvFile(), "path to pepita .env for ANTHROPIC_API_KEY")
 	judgeModel := flag.String("judge", "claude-sonnet-5", "model that judges acknowledgment quality (ungated); empty to skip")
+	runName := flag.String("run", "", "name for this eval run in Langfuse (default: <prompt-version>-<unix>); requires LANGFUSE_* env vars")
+	lfDataset := flag.String("langfuse-dataset", "turn-classifier", "Langfuse dataset name the corpus is pushed to")
 	flag.Parse()
 
 	names := splitCSV(*models)
@@ -142,8 +155,46 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Intent-classification eval — cases=%d concurrency=%d\nmodels: %s\n\n",
-		len(dataset), *conc, strings.Join(names, ", "))
+	// Optional Langfuse export: every case becomes a trace tagged "eval", carrying
+	// the run name, the classifier prompt version, and expected-vs-got. That turns
+	// this run into queryable history (accuracy per prompt version, drill into the
+	// misses) instead of terminal output that scrolls away. No credentials = no-op,
+	// so the offline gate is unaffected.
+	obsShutdown, obsOn, err := obs.Init(context.Background())
+	if err != nil {
+		fmt.Printf("(langfuse export unavailable, continuing without it: %v)\n", err)
+		obsOn = false
+	}
+	promptVer := llm.ClassifyPromptVersion()
+	run := strings.TrimSpace(*runName)
+	if run == "" {
+		run = fmt.Sprintf("%s-%d", promptVer, time.Now().Unix())
+	}
+	// The REST side (datasets/experiments/scores) is what OTel has no concept of.
+	// It shares the same credentials, so it's on exactly when tracing is.
+	var lf *lfExport
+	if obsOn {
+		fmt.Printf("langfuse run %q -> %s\n", run, obs.Host())
+		defer func() {
+			// Flush before exit: the batch exporter is asynchronous, so without this
+			// a short run would drop most of its spans.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := obsShutdown(ctx); err != nil {
+				fmt.Printf("(langfuse flush: %v)\n", err)
+			}
+		}()
+		if c, ok := obs.NewClient(); ok {
+			lf = &lfExport{c: c, dataset: *lfDataset, run: run, promptVer: promptVer}
+			if err := lf.pushCorpus(context.Background()); err != nil {
+				fmt.Printf("(langfuse dataset push failed, experiment export disabled: %v)\n", err)
+				lf = nil
+			}
+		}
+	}
+
+	fmt.Printf("Intent-classification eval — cases=%d concurrency=%d prompt=%s\nmodels: %s\n\n",
+		len(dataset), *conc, promptVer, strings.Join(names, ", "))
 
 	reports := make([]report, 0, len(names))
 	for _, name := range names {
@@ -153,8 +204,16 @@ func main() {
 			reports = append(reports, report{model: name, buildErr: err})
 			continue
 		}
-		rep := evaluate(name, cl, *conc, judge)
+		if obsOn {
+			cl = obs.TraceClassifier(cl, name)
+		}
+		rep := evaluate(name, cl, *conc, judge, run)
 		printReport(rep)
+		if lf != nil {
+			if err := lf.pushRun(context.Background(), rep); err != nil {
+				fmt.Printf("(langfuse export for %s degraded: %v)\n", name, err)
+			}
+		}
 		reports = append(reports, rep)
 	}
 
@@ -178,13 +237,9 @@ func main() {
 
 // evaluate runs the whole dataset through one classifier with a worker pool,
 // then (if a judge is given) scores the acknowledgments the classifier produced.
-func evaluate(name string, cl llm.Classifier, conc int, judge llm.Completer) report {
+func evaluate(name string, cl llm.Classifier, conc int, judge llm.Completer, run string) report {
 	start := time.Now()
-	type outcome struct {
-		c   evalCase
-		got llm.Turn
-		err error
-	}
+	type outcome = caseResult
 	outcomes := make([]outcome, len(dataset))
 	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
@@ -194,16 +249,26 @@ func evaluate(name string, cl llm.Classifier, conc int, judge llm.Completer) rep
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
 			c := dataset[i]
+			// The labeled expectation rides along on the context, so the tracing
+			// wrapper can record expected-vs-got without the eval knowing whether
+			// tracing is even on.
+			ctx := obs.WithEvalCase(context.Background(), obs.EvalCase{
+				Run:             run,
+				ExpectedIntent:  string(c.want),
+				ExpectedClarity: string(c.clarity),
+			})
+			var ref obs.TraceRef
+			ctx = obs.WithTraceRef(ctx, &ref)
+			ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			defer cancel()
 			turn, err := cl.ClassifyTurn(ctx, c.q, c.reply)
-			outcomes[i] = outcome{c: c, got: turn, err: err}
+			outcomes[i] = outcome{c: c, got: turn, err: err, traceID: ref.ID()}
 		}(i)
 	}
 	wg.Wait()
 
-	rep := report{model: name, cm: map[llm.Intent]map[llm.Intent]int{}, elapsed: time.Since(start)}
+	rep := report{model: name, cm: map[llm.Intent]map[llm.Intent]int{}, elapsed: time.Since(start), cases: outcomes}
 	for _, w := range intents {
 		rep.cm[w] = map[llm.Intent]int{}
 	}

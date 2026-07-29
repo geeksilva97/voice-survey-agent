@@ -8,6 +8,8 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -394,6 +396,23 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 	"- NEVER invent facts about the product or the respondent. If nothing specific fits, a brief neutral " +
 	"nod ('Got it.') is fine, but prefer specificity.\n" +
 	"Respond ONLY as JSON with intent, sufficient, clarity, and ack."
+
+// ClassifyPromptVersion is a short, stable fingerprint of the classifier's
+// instructions — the system prompt plus the few-shot anchors. It changes exactly
+// when those change, so traces and eval runs can be attributed to the prompt
+// that produced them ("did this score move because I edited the prompt?").
+// Not a semantic version: it's content-addressed, so it can't drift out of sync
+// with the prompt the way a hand-bumped number would.
+func ClassifyPromptVersion() string {
+	_, shots := classifyPrompt("", "")
+	h := sha256.New()
+	h.Write([]byte(classifySystem))
+	for _, m := range shots {
+		h.Write([]byte(m.Role))
+		h.Write([]byte(m.Content))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}
 
 // ClassifyTurn (Ollama backend) reads a respondent reply in the context of the
 // current question. Runs at temperature 0 so the label is stable/repeatable.

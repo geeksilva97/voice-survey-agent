@@ -355,6 +355,287 @@ go run ./cmd/server                       # then open /insights/<a completed pol
 go run ./cmd/server -insight-model claude-sonnet-5   # score with a hosted model
 ```
 
+### Closing-line eval — `go run ./cmd/evalclosing`
+
+A second, deliberately narrow eval for the **personalized sign-off**. Full
+rationale in [cmd/evalclosing/EVAL.md](cmd/evalclosing/EVAL.md).
+
+Built to answer one question with a number: the browser QA run caught the agent
+opening its farewell with the respondent's own filler (*"Sure thing, thanks for
+sharing!"*). **Deterministic only — no LLM judge**, because the defect is exactly
+string-detectable; a judge would add cost and noise over a `strings.HasPrefix`.
+
+Fidelity: it drives `ws.ClosingSystem`, `ws.ClosingUserPrompt`,
+`ws.CloseTranscript` and `ws.SanitizeClosing`, and builds a real `survey.Survey`
+per case, so the transcript is rendered by production code. Those identifiers were
+exported from `internal/ws` for exactly this — re-typing the prompt in a harness
+is how an eval silently stops measuring what ships.
+
+```bash
+go run ./cmd/evalclosing                                              # print only
+./scripts/with-langfuse.sh go run ./cmd/evalclosing -run baseline-before-fix
+```
+
+**Not in `validate.sh`** (needs a live model; the gate stays fast and offline).
+The scorer unit tests are, via `go test ./cmd/evalclosing/`.
+
+**Baseline (2026-07-29, `qwen2.5:3b`, closing prompt `a2844dfca273`):**
+
+| Metric | Result |
+|---|---|
+| clean opener | **9/13 — 69.2%** |
+| clean opener, **tic cases** | **4/8 — 50.0%** |
+| within 35 words | 13/13 |
+| no question mark | 13/13 |
+| mean copied span | 2.2 words |
+
+Langfuse run `qwen2.5:3b@baseline-before-fix` on dataset `closing-line`; verified
+via the API that 13 items, 13 run items and the aggregates landed, with
+`clean_opener_rate: 0.6923` matching the terminal. **All control cases passed**, so
+the defect is specific to tic input rather than a general register problem. The
+worst case, `okay-so`, failed both checks at once — opened with the filler *and*
+lifted nine consecutive words.
+
+**After the fix — closing prompt `99bfe50db4e1`** (prompt rule +
+`ws.StripFillerOpener`, 15 cases):
+
+| Metric | Before | After |
+|---|---|---|
+| MODEL clean opener (prompt quality) | 69.2% | **86.7%** |
+| MODEL clean opener, **tic cases** | **50.0%** | **75.0%** |
+| FINAL clean opener (post-guard) | 69.2% | **100%** |
+| guard fired | — | 2/15 |
+
+The guard lives in `internal/ws/closing.go` and shares its filler list with the
+eval's scorer — one definition, so the measurement and the repair cannot disagree
+about what counts as filler. It **repairs rather than rejects** (the rest of the
+line is fine) and **fails open** (a guard that can empty the agent's last words is
+worse than the tic). Browser QA re-run: poll `94243ba6d5`, `end_reason=completed`,
+2/2 slots, screenshot `qa-screenshots/closing-fix-qa-enthusiast.png`.
+
+> ⚠️ **Still open — verbatim parroting.** The same browser QA produced a closing
+> that copied **16 consecutive words** from the respondent's last answer. The
+> offline corpus had missed the entire class because every case had short answers;
+> a long, fluent, quotable final answer is what tempts wholesale repetition. Two
+> `quotable-*` cases were added from that live transcript and now reproduce it
+> deterministically. **Not fixed** — it needs another prompt iteration, and the
+> lavender incident below is the reason not to attempt one blind.
+
+> **Three corrections this harness produced, all worth keeping.**
+> 0. **A prompt example became a template.** The first version of the fix ended the
+>    new rule with a worked example ("Lavender for the bedroom — lovely."). The 3B
+>    model copied it into **all 13 cases**, inventing lavender for a respondent who
+>    said only "Vanilla." — while every deterministic score read 100%. Negative
+>    examples (the filler phrases not to use) were never copied; the positive one
+>    was. Removed it; added `UnsupportedWords` as a tripwire for the class.
+> 1. The verbatim-reuse claim was called **refuted** on 6 transcripts — and that
+>    verdict was **under-powered, not correct**. None of those 6 had a long quotable
+>    answer; once such a case existed, a 16-word copy reproduced immediately. The
+>    original *"coastal and tropical blends"* reading was still wrong (it is a real
+>    paraphrase, pinned in `TestLongestCopiedSpan`), but "refuted" was too strong a
+>    word for what the corpus could support. A negative result is only as strong as
+>    the input shapes present.
+> 2. The **first** baseline run was discarded: it scored 76.9% because
+>    `FillerOpener` missed stacked fillers (`"Okay so,"`). Fixed and pinned by
+>    `TestFillerOpenerStacked` before the baseline was recorded — a scorer bug
+>    found after the baseline would have invalidated the comparison.
+
+### Langfuse observability + experiment tracking (optional, `internal/obs`)
+
+Two independent exports to [Langfuse](https://langfuse.com), both off unless
+credentials are present. Langfuse ships **no Go SDK**, so each half uses its
+officially supported non-SDK path:
+
+| Half | Transport | What it covers |
+|---|---|---|
+| **Traces** | OpenTelemetry → OTLP/HTTP → `/api/public/otel/v1/traces` | every `ClassifyTurn`, in production and in the eval |
+| **Datasets / experiments / scores** | hand-written REST client (`internal/obs/langfuse.go`) | the labeled corpus, per-model runs, gated + ungated metrics |
+
+The only third-party dependency added is the **official OpenTelemetry Go SDK**
+(`go.opentelemetry.io/otel`); the REST half is raw `net/http`, matching how
+`internal/llm` talks to Anthropic.
+
+**Env-driven, off by default.** Enabled only when `LANGFUSE_PUBLIC_KEY` and
+`LANGFUSE_SECRET_KEY` are set (`LANGFUSE_HOST` optional, defaults to Langfuse
+Cloud). Without them every entry point is a no-op, so the gate and the PoC stay
+fully offline. **Keys are never logged** (same rule as the Anthropic key) — the
+secret exists only inside the encoded Basic header.
+
+**Never fatal.** A broken/unreachable Langfuse degrades with a log line; it never
+stops the server taking calls or the eval from running (and therefore can never
+change the gate's verdict).
+
+#### What is traced
+
+Instrumentation is applied by **wrapping interfaces at construction** in
+`cmd/server/main.go` and `cmd/eval/main.go` — no span is created in a handler or
+in `internal/llm`, so the rest of the app is unaware tracing exists.
+
+| Span | Source | Notes |
+|---|---|---|
+| `classify_turn` | `llm.Classifier` (wrapped once) | covers all 3 `ws` call sites + the eval |
+| `greeting_reply`, `closing_line` | the Closer `llm.Completer` | one shared wrapper; told apart by `obs.WithLabel` |
+| `insight_scoring` | the insight `llm.Completer` | one-shot results pass |
+| `stt`, `tts` | `speech.Engine` via `obs.StartOp` | latency + payload bytes; these take no `context`, so they're traced at the call site |
+| prompt versions | `llm.ClassifyPromptVersion`, `ws.ClosingPromptVersion` | content hashes stamped on the span, so a score movement is attributable to a prompt edit rather than guessed at |
+| `qa_persona_reply` | the dev-only `-qa` endpoint | the simulated respondent, not the agent |
+
+Still untraced: question generation (`GenerateSurvey`). Anything driving the
+conversation through a different interface than `llm.Classifier` would also need
+its own wrapper — the decorators above cover these two interfaces only.
+
+#### Production traces (`cmd/server`)
+
+- `obs.TraceClassifier` is a **pure pass-through decorator** over any
+  `llm.Classifier` (Ollama or Anthropic) — it never alters the `Turn` or the
+  error, so conversation behavior is identical with tracing on or off.
+- Each span carries question/reply as input, the full `Turn` as output,
+  intent/clarity/sufficient, the model, and the **classifier prompt version**
+  (`llm.ClassifyPromptVersion` — a content hash of the system prompt + few-shots,
+  so a score shift can be attributed to a prompt edit).
+- Each WebSocket conversation tags its context with a per-run session id
+  (`<pollID>-<unix>` → `langfuse.session.id`), so one conversation reads as one
+  session.
+- The `x-langfuse-ingestion-version: 4` header is set, which is what makes
+  Langfuse's **server-side LLM-as-judge evaluators** able to run on these
+  OTel-ingested traces (configured in the Langfuse UI, no Go code).
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-… LANGFUSE_SECRET_KEY=sk-lf-… go run ./cmd/server
+# logs: "langfuse tracing enabled -> https://cloud.langfuse.com"
+```
+
+#### Eval runs as experiments (`cmd/eval`)
+
+With credentials set, an eval run also publishes itself as a Langfuse dataset
+experiment, turning terminal output that scrolls away into comparable history:
+
+- the hand-labeled corpus becomes one **dataset** (`-langfuse-dataset`, default
+  `turn-classifier`); items upsert by a content-hash id, so re-pushing every run
+  creates no duplicates;
+- each model's pass becomes one **run** named `<model>@<run>` (`-run`, default
+  `<prompt-version>-<unix>`);
+- each case contributes a **run item** linking the dataset item to the trace that
+  classification produced, plus a per-case `intent_correct` BOOLEAN score;
+- the aggregates land as **run-level scores**: `intent_accuracy`,
+  `answer_acceptance`, `clarity_accuracy`, and `ack_quality` when judged.
+
+```bash
+LANGFUSE_PUBLIC_KEY=… LANGFUSE_SECRET_KEY=… go run ./cmd/eval -run before-prompt-fix
+```
+
+Two API constraints the client is built around (verified against the live
+OpenAPI spec): datasets upsert by **name** and dataset items by **id**, but
+**dataset run items are not idempotent** — the server mints their ids, so they
+are posted once and only ever retried on a `404`, which means the trace hasn't
+been ingested yet (traces are force-flushed via `obs.Flush` before linking).
+
+**Validated (2026-07-29):**
+
+1. **Unit** — 10 tests in `internal/obs`: the disabled no-op path, that `Init`
+   actually **succeeds** with credentials (see the regression note below), trace
+   id capture, decorator pass-through incl. error propagation, and the REST
+   client driven against an `httptest` fake Langfuse — endpoint paths, required
+   field names, Basic auth on every call, score subject targeting (trace vs run),
+   `BOOLEAN` value validation, 404-retry, and no-retry on other errors.
+2. **End-to-end against a local fake Langfuse** — a full
+   `go run ./cmd/eval -models qwen2.5:3b -judge ""` produced exactly:
+   1 dataset, 82 dataset items, **82/82 cases linked** to run items, 85 scores
+   (82 per-case + 3 aggregates; `ack_quality` correctly skipped with no judge),
+   and 4 OTLP batches — auth present on every call.
+3. **Production path** — server started with tracing on
+   (`langfuse tracing enabled`), `cmd/probe -mode happy` reached
+   `reason=completed` unchanged, OTLP batches 4 → 12.
+4. **Gate** — `./scripts/validate.sh` **7/7** with credentials unset, and the
+   eval reports identical numbers (95.1% / 95.7%) traced and untraced.
+
+> ⚠️ **Regression note worth keeping.** The first cut of `obs.Init` merged a
+> pinned `semconv` schema URL into the default OTel resource, which fails with
+> *"conflicting Schema URL"* — meaning tracing was broken on **every**
+> credentialed start, and `cmd/server` would have called `log.Fatalf` and refused
+> to boot. Unit tests missed it because they only exercised the
+> credentials-absent path; the fake-Langfuse smoke run caught it immediately. Fix:
+> `sdkresource.NewSchemaless`, plus `TestInitEnabledWithKeys` so the credentialed
+> path is now covered, plus degrade-not-abort in `cmd/server`.
+
+5. **Against a REAL Langfuse** (self-hosted locally, v3.224.3 — see below):
+   - eval run `qwen2.5:3b@first-real-run` → **82 traces** ingested, each tagged
+     `eval`, carrying `prompt_version=79bec7b42725`, `expected_intent`,
+     `intent_correct`, the question/reply as input and the full `Turn` as output;
+   - **85 scores**: 82 per-case `intent_correct` + 3 run-level aggregates whose
+     values match the terminal exactly — `intent_accuracy` 0.9512,
+     `answer_acceptance` 0.9565, `clarity_accuracy` 0.6739;
+   - **idempotency proven**: after three runs pushing the same corpus the dataset
+     holds **82 items, not 246**, with 2 distinct runs recorded;
+   - **production path**: a `cmd/probe -mode happy` conversation produced 12
+     traces all grouped under one session (`8b910e2a93-…`), untagged so they stay
+     separable from eval traces, and still ended `reason=completed`.
+
+6. **Browser E2E with tracing on** (2026-07-29, Chrome DevTools MCP, fake mic,
+   `enthusiast` persona, candles, poll `dfa9e6d7fb`, real local Langfuse):
+   `end_reason=completed`, **3/3 slots answered** with verbatim STT text, full
+   greeting flow (hello → reply → framing + "ready?" → go-ahead → Q1-3) and a
+   personalized close referencing the respondent's own words ("coastal and
+   tropical blends"). Screenshot:
+   `qa-screenshots/langfuse-qa-enthusiast-completed.png`.
+
+   The run produced **24 traces in one session** (`dfa9e6d7fb-1785330618`) —
+   `tts` ×12, `classify_turn` ×5, `stt` ×5, `greeting_reply` ×1, `closing_line`
+   ×1 — proving session grouping and every new span type. The insight pass added
+   `insight_scoring`; the 5 `qa_persona_reply` spans are the simulated
+   respondent and correctly carry **no** session id (they're not conversation
+   turns).
+
+   **First actionable finding from the new spans — TTS dominates the audio path:**
+
+   | operation | n | p50 | max | total |
+   |---|---|---|---|---|
+   | `tts` | 12 | 0.79s | 2.14s | **11.15s** |
+   | `stt` | 5 | 0.33s | 0.37s | 1.61s |
+   | `classify_turn` | 5 | 0.90s | 1.21s | — |
+   | `insight_scoring` | 1 | 14.59s | — | (post-call, off the hot path) |
+
+   Synthesis cost ~7× transcription across one 3-question call. That is direct
+   evidence for the streaming-TTS upgrade already noted in the README's
+   next-steps (`GenerateWithCallback`), and it was invisible before these spans.
+
+Not re-run after the final one-line `qa_persona_reply` label change: it renames a
+span on the dev-only QA endpoint and touches no conversational logic.
+
+#### The local Langfuse stack
+
+Self-hosted at `~/projects/langfuse-local` (outside this repo, so nothing secret
+lands here):
+
+- upstream `docker-compose.yml` kept **byte-identical** to Langfuse's, so it can
+  be re-fetched to upgrade; all local changes live in `docker-compose.override.yml`.
+- **Port remaps** (both upstream defaults were already taken on this machine):
+  web `3000 → 3001` (a node process holds 3000), postgres `5432 → 5434`
+  (`myjourney-db-1` holds 5432). The override uses the `!override` YAML tag —
+  Compose *merges* sequences by default, so a plain `ports:` list would have
+  **added** 3001 while still trying to bind the taken 3000.
+- **Headless provisioning**: the org, project, user and API key pair are created
+  on first start from `LANGFUSE_INIT_*` in that stack's `.env` — no browser signup
+  was needed. `NEXTAUTH_URL` must match the remapped port or login redirects break.
+- `SALT`, `ENCRYPTION_KEY` and `NEXTAUTH_SECRET` are `openssl rand -hex 32`
+  values, not the compose file's `CHANGEME` defaults. Telemetry is off.
+
+```bash
+cd ~/projects/langfuse-local && docker compose up -d   # UI: http://localhost:3001
+```
+
+Run either binary against it with the wrapper, which exports the keys and fails
+fast if the stack is down (`LANGFUSE_ENV_FILE` points it at another instance,
+e.g. Langfuse Cloud):
+
+```bash
+./scripts/with-langfuse.sh go run ./cmd/server
+./scripts/with-langfuse.sh go run ./cmd/eval -run before-prompt-fix
+```
+
+> Not wired into `validate.sh` on purpose: the gate must stay offline and must not
+> depend on a running container. Tracing is always opt-in.
+
 ### Phase-0 backbone spike (run if speech/models change)
 
 ```bash

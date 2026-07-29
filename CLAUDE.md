@@ -80,6 +80,7 @@ cmd/
   server/   the PoC web server (setup + voice + results/insights pages)
   probe/    drives the whole conversation over WebSocket, no browser/mic (used by validate.sh)
   eval/     scores the turn classifier against a labeled dataset (see cmd/eval/EVAL.md)
+  evalclosing/ scores the personalized CLOSING LINE — deterministic only, no judge (see cmd/evalclosing/EVAL.md)
   genclips/ synthesizes fixed answer WAVs for the browser demo (one-off)
   spike/    Phase-0 proof that Kokoro+Whisper load from Go
 internal/
@@ -89,6 +90,7 @@ internal/
   speech/   sherpa-onnx wrappers: Whisper STT + Kokoro TTS (+ Silence, SynthesizeVoice)
   session/  poll store (in-mem + JSON in data/<id>.json)
   insight/  one-shot results scoring pass
+  obs/      OPTIONAL Langfuse export: OTel traces + dataset experiments/scores (no-op without LANGFUSE_* keys)
   qa/       simulated respondent personas for browser E2E (dev/test only)
 web/        index/poll/results/insights pages + static/js/client.js
 scripts/
@@ -131,6 +133,9 @@ ending logic all run for real; only the *input device* (mic) is faked.
   round-trip, fixed clips vs. LLM personas, the `-qa` endpoint, the `qa_intent`
   channel, and both ways to run it (Chrome MCP + Playwright).
 - [cmd/eval/EVAL.md](cmd/eval/EVAL.md) — classifier eval strategy.
+- [cmd/evalclosing/EVAL.md](cmd/evalclosing/EVAL.md) — closing-line eval: the
+  filler-echo defect, why it's measured deterministically (no judge), and the
+  pre-fix baseline.
 - [VALIDATION.md](VALIDATION.md) — the living log: every capability, how it's
   validated, and last-run results. **Update this on every change.**
 
