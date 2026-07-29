@@ -241,13 +241,13 @@ func TestIntroLine(t *testing.T) {
 // TestSanitizeClosing: a good one-liner is kept (quotes stripped, newlines
 // collapsed); empty or oversized output is rejected so the fixed close is used.
 func TestSanitizeClosing(t *testing.T) {
-	if got := sanitizeClosing("  \"Loved that the lavender one is your\nevening ritual — take care!\"  "); got != "Loved that the lavender one is your evening ritual — take care!" {
-		t.Errorf("sanitizeClosing should strip quotes and collapse newlines; got %q", got)
+	if got := SanitizeClosing("  \"Loved that the lavender one is your\nevening ritual — take care!\"  "); got != "Loved that the lavender one is your evening ritual — take care!" {
+		t.Errorf("SanitizeClosing should strip quotes and collapse newlines; got %q", got)
 	}
-	if got := sanitizeClosing("   "); got != "" {
+	if got := SanitizeClosing("   "); got != "" {
 		t.Errorf("empty closing should be rejected; got %q", got)
 	}
-	if got := sanitizeClosing(strings.Repeat("blah ", 100)); got != "" {
+	if got := SanitizeClosing(strings.Repeat("blah ", 100)); got != "" {
 		t.Errorf("oversized closing should be rejected so the fixed line is used; got %q", got)
 	}
 }
@@ -260,7 +260,7 @@ func TestCloseTranscript(t *testing.T) {
 	sv.RecordAnswer("about three times a week")
 	sv.CaptureAndAdvance("") // Q3 skipped → must not appear
 
-	got := closeTranscript(sv)
+	got := CloseTranscript(sv)
 	if !strings.Contains(got, "Q1?") || !strings.Contains(got, "I love the lavender one") {
 		t.Errorf("transcript should include answered slots; got %q", got)
 	}
@@ -268,7 +268,7 @@ func TestCloseTranscript(t *testing.T) {
 		t.Errorf("transcript must omit skipped slots; got %q", got)
 	}
 
-	if got := closeTranscript(survey.New([]string{"Q1?"})); got != "" {
+	if got := CloseTranscript(survey.New([]string{"Q1?"})); got != "" {
 		t.Errorf("no answers → empty transcript (forces fixed close); got %q", got)
 	}
 }

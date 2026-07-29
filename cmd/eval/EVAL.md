@@ -171,6 +171,40 @@ misclassified replies.
 
 ---
 
+## Publishing a run to Langfuse (optional)
+
+Everything above is a snapshot: the terminal prints the numbers and they scroll
+away. With `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` set, the same run also
+publishes itself as a **Langfuse dataset experiment**, which is what turns the
+eval from a pass/fail gate into *history*:
+
+- **This corpus becomes a dataset** (`-langfuse-dataset`, default
+  `turn-classifier`). Items upsert by a content hash of `(question, reply)`, so
+  re-pushing on every run is free and editing `dataset.go` only touches the items
+  that actually changed.
+- **Each model's pass becomes a run**, named `<model>@<run>` where `-run` defaults
+  to `<prompt-version>-<unix>`. Models are separate runs over identical items,
+  which is what Langfuse compares side by side.
+- **Each case becomes a run item** linked to the trace that classification
+  produced, carrying an `intent_correct` score — so you can filter a run down to
+  just the misses and read the actual replies.
+- **The headline metrics become run-level scores**: `intent_accuracy`,
+  `answer_acceptance`, `clarity_accuracy`, `ack_quality`.
+
+```bash
+# name the run after what you changed, so the comparison reads clearly later
+LANGFUSE_PUBLIC_KEY=… LANGFUSE_SECRET_KEY=… go run ./cmd/eval -run before-cough-guard
+```
+
+Every classifier span is tagged with `llm.ClassifyPromptVersion()` — a content
+hash of the system prompt *and* the few-shot anchors. That's the link that makes
+"did this score move because I edited the prompt?" answerable rather than
+guessed: group runs by prompt version and the answer is in the chart.
+
+The export is strictly additive — no credentials means no-op, and a Langfuse
+failure logs and continues, so it can never change this eval's exit code.
+Implementation and the API constraints it works around are in `internal/obs`.
+
 ## Extending it
 
 - **Add a case:** append an `evalCase` to `dataset.go` under the matching section.

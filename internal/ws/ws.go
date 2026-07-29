@@ -20,6 +20,8 @@ package ws
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -31,6 +33,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/obs"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
 	"voicesurvey/internal/survey"
@@ -127,7 +130,10 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close()
 
-	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey}
+	// Base context for the whole session, tagged with a per-run id so traces
+	// (when Langfuse tracing is on) group one conversation per session.
+	ctx := obs.WithSession(context.Background(), fmt.Sprintf("%s-%d", poll.ID, time.Now().Unix()))
+	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey, ctx: ctx}
 	conv.run()
 }
 
@@ -137,10 +143,11 @@ type conversation struct {
 	poll *session.Poll
 	c    *websocket.Conn
 	sv   *survey.Survey
+	ctx  context.Context // session-scoped base context (carries the trace session id)
 
-	speaking   bool // true while we expect the client to be playing audio
-	strikes    int  // consecutive silence nudges
-	reasks     int  // times we've re-read the current question
+	speaking      bool // true while we expect the client to be playing audio
+	strikes       int  // consecutive silence nudges
+	reasks        int  // times we've re-read the current question
 	inGreeting    bool // awaiting the reply to the opening "how's your day" small-talk
 	awaitingStart bool // greeting done + framed; awaiting a "ready?" go-ahead before Q1
 
@@ -246,7 +253,11 @@ func (cv *conversation) run() {
 // handleUtterance transcribes a reply, classifies it, updates the survey, and
 // speaks the next thing. Returns true when the conversation has ended.
 func (cv *conversation) handleUtterance(pcm []byte) bool {
+	// STT latency is dead air on a live call and is invisible in the LLM spans,
+	// so it gets its own traced operation.
+	stt := obs.StartOp(cv.ctx, "stt").Bytes("audio.pcm_bytes", len(pcm))
 	text := cv.h.Speech.Transcribe(pcm, inputSampleRate)
+	stt.Out(text).End()
 	cv.send(outMsg{Type: "transcript", Text: text})
 
 	// The opening small-talk reply is handled separately — it's not a survey slot.
@@ -264,7 +275,7 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 		return cv.finishCompleted("")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(cv.ctx, 15*time.Second)
 	defer cancel()
 	turn, err := cv.h.LLM.ClassifyTurn(ctx, q.Text, text)
 	if err != nil {
@@ -426,32 +437,62 @@ func (cv *conversation) personalClose() string {
 	if cv.h.Closer == nil {
 		return ""
 	}
-	transcript := closeTranscript(cv.sv)
+	transcript := CloseTranscript(cv.sv)
 	if transcript == "" {
 		return "" // nothing captured to reference — a personalized line would be hollow
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx := obs.WithLabel(cv.ctx, "closing_line")
+	// Stamp WHICH closing prompt produced this line, so a before/after in Langfuse
+	// splits by prompt version instead of being guessed at.
+	ctx = obs.WithPromptVersion(ctx, ClosingPromptVersion())
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	raw, err := cv.h.Closer.Complete(ctx, closingSystem, "Product: "+cv.poll.Product+"\n\nWhat the respondent said:\n"+transcript+"\n\nWrite the closing line.")
+	raw, err := cv.h.Closer.Complete(ctx, ClosingSystem, ClosingUserPrompt(cv.poll.Product, transcript))
 	if err != nil {
 		log.Printf("personalized close degraded, using fixed line: %v", err)
 		return ""
 	}
-	return sanitizeClosing(raw)
+	// Deterministic register guard: the prompt asks the model not to open with a
+	// filler, but the small local model does it anyway about half the time (see
+	// cmd/evalclosing). Stripping repairs the line instead of discarding it.
+	return StripFillerOpener(SanitizeClosing(raw))
 }
 
-const closingSystem = "You are a friendly voice-survey agent wrapping up a short spoken survey. " +
+// ClosingUserPrompt builds the user message for the closing generation.
+//
+// It is exported so an offline eval drives the EXACT prompt production uses.
+// Leaving this string inlined above and re-typing it in the harness is precisely
+// how an eval silently stops measuring the real thing.
+func ClosingUserPrompt(product, transcript string) string {
+	return "Product: " + product + "\n\nWhat the respondent said:\n" + transcript + "\n\nWrite the closing line."
+}
+
+// ClosingPromptVersion is a short, stable fingerprint of the closing
+// instructions — the same device as llm.ClassifyPromptVersion. It changes exactly
+// when ClosingSystem changes, which is what lets a score movement be attributed
+// to a prompt edit rather than to noise.
+func ClosingPromptVersion() string {
+	sum := sha256.Sum256([]byte(ClosingSystem))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+const ClosingSystem = "You are a friendly voice-survey agent wrapping up a short spoken survey. " +
 	"Write ONE warm closing line to SAY OUT LOUD. Requirements: reference ONE " +
 	"specific, genuine thing the respondent actually said (their idea, not their " +
 	"exact words); then thank them and say goodbye. 1-2 short sentences, natural " +
 	"spoken English (contractions welcome), under 35 words. No lists, no emoji, no " +
-	"questions, no placeholders. Never invent anything they did not say. Output " +
-	"only the spoken line, nothing else."
+	"questions, no placeholders. Never invent anything they did not say. " +
+	"START IN YOUR OWN VOICE: do NOT open with a filler or acknowledgment phrase " +
+	"(\"Sure thing,\" \"Well,\" \"You know,\" \"Okay so,\" \"To be fair,\" \"Honestly,\"), " +
+	"and never open by echoing a filler the respondent themselves kept using — those " +
+	"answer a question instead of closing the conversation. Open directly with the " +
+	"specific thing THIS respondent mentioned. " +
+	"Output only the spoken line, nothing else."
 
-// closeTranscript renders the answered slots as a compact Q/A transcript for the
+// CloseTranscript renders the answered slots as a compact Q/A transcript for the
 // closing prompt. Skipped/empty slots are omitted so the model can't reference a
 // question the respondent never actually engaged with.
-func closeTranscript(sv *survey.Survey) string {
+func CloseTranscript(sv *survey.Survey) string {
 	var b strings.Builder
 	for _, q := range sv.Questions {
 		a := strings.TrimSpace(q.Answer)
@@ -467,10 +508,10 @@ func closeTranscript(sv *survey.Survey) string {
 	return strings.TrimSpace(b.String())
 }
 
-// sanitizeClosing trims the model's farewell and rejects (returns "") anything
+// SanitizeClosing trims the model's farewell and rejects (returns "") anything
 // implausible — empty, multi-paragraph, or too long — so a misbehaving model
 // can never speak junk at the end. Surrounding quotes are stripped.
-func sanitizeClosing(s string) string {
+func SanitizeClosing(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.Trim(s, `"`)
 	s = strings.TrimSpace(s)
@@ -582,7 +623,7 @@ func timeOfDay(t time.Time) string {
 func (cv *conversation) handleGreeting(text string) bool {
 	cv.inGreeting = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(cv.ctx, 15*time.Second)
 	defer cancel()
 	turn, err := cv.h.LLM.ClassifyTurn(ctx, greetingQuestion, text)
 	if err != nil {
@@ -666,7 +707,7 @@ func startsWithTransition(s string) bool {
 func (cv *conversation) handleStart(text string) bool {
 	cv.awaitingStart = false
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(cv.ctx, 15*time.Second)
 	defer cancel()
 	turn, err := cv.h.LLM.ClassifyTurn(ctx, "Are you ready to start the questions?", text)
 	if err != nil {
@@ -700,7 +741,7 @@ func (cv *conversation) composeGreetingLead(reply, ackFallback string) string {
 	purpose := strings.TrimSpace(cv.poll.Purpose)
 	_, count := cv.sv.Progress() // total number of questions
 	if cv.h.Closer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(obs.WithLabel(cv.ctx, "greeting_reply"), 15*time.Second)
 		defer cancel()
 		user := fmt.Sprintf("Time of day: %s.\nThey just said: %q\n\nWrite your spoken reply, ending with the hand-off into the survey.",
 			timeOfDay(time.Now()), strings.TrimSpace(reply))
@@ -808,7 +849,7 @@ func (cv *conversation) startSurvey(lead string) bool {
 // sanitizeSpoken trims a model-authored spoken line and rejects (returns "")
 // anything implausible — empty or too long — so a misbehaving model can never
 // speak junk. Surrounding quotes are stripped and stray newlines collapsed.
-// Unlike sanitizeClosing it tolerates a question mark (Ava may reciprocate).
+// Unlike SanitizeClosing it tolerates a question mark (Ava may reciprocate).
 func sanitizeSpoken(raw string, maxRunes int) string {
 	s := strings.TrimSpace(raw)
 	s = strings.Trim(s, `"'`)
@@ -847,7 +888,9 @@ func (cv *conversation) emit(msg outMsg, ttsText string) {
 // multi-beat turns (speakPaced) stream several segments before one tts_end.
 func (cv *conversation) streamTTS(text string) {
 	for _, chunk := range splitSentences(text) {
+		tts := obs.StartOp(cv.ctx, "tts").In(chunk)
 		wav, err := cv.h.Speech.Synthesize(chunk)
+		tts.Bytes("audio.wav_bytes", len(wav)).Fail(err).End()
 		if err != nil {
 			log.Printf("tts error: %v", err)
 			continue

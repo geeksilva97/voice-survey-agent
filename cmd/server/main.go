@@ -15,6 +15,7 @@ import (
 
 	"voicesurvey/internal/insight"
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/obs"
 	"voicesurvey/internal/qa"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
@@ -86,6 +87,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("insight completer: %v", err)
 	}
+
+	// Optional Langfuse tracing (OTel over OTLP/HTTP). Enabled only when the
+	// LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars are set; otherwise every
+	// wrapper below is skipped and the PoC stays fully offline. Keys are never
+	// logged. Degrade, never abort: losing traces is not a reason to refuse calls.
+	obsShutdown, obsOn, err := obs.Init(context.Background())
+	if err != nil {
+		log.Printf("langfuse tracing unavailable, continuing without it: %v", err)
+		obsOn = false
+	}
+	if obsOn {
+		// Wrapping the interfaces (not the call sites) is what keeps the rest of
+		// the app unaware tracing exists. The closer authors both the greeting
+		// reply and the closing sign-off, so those two are told apart by the
+		// obs.WithLabel the caller sets rather than by separate wrappers.
+		classifier = obs.TraceClassifier(classifier, cm)
+		closer = obs.TraceCompleter(closer, cm)
+		insightLLM = obs.TraceCompleter(insightLLM, *insightModel)
+		log.Printf("langfuse tracing enabled -> %s", obs.Host())
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = obsShutdown(ctx)
+		}()
+	}
+
 	log.Printf("question-gen model: %s | classify model: %s | insight model: %s", *ollamaModel, cm, *insightModel)
 
 	store, err := session.NewStore(*dataDir)
@@ -206,7 +233,7 @@ func (a *app) getInsights(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(obs.WithLabel(r.Context(), "insight_scoring"), 120*time.Second)
 	defer cancel()
 	res, err := insight.Score(ctx, a.insightLLM, a.insightModel, in)
 	if err != nil {
@@ -246,7 +273,9 @@ func qaReply(gen llm.Completer, eng *speech.Engine) http.HandlerFunc {
 			http.Error(w, "unknown persona", http.StatusBadRequest)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		// Labelled so the simulated respondent's turns are distinguishable from the
+		// agent's own generations in traces — this endpoint shares the Closer.
+		ctx, cancel := context.WithTimeout(obs.WithLabel(r.Context(), "qa_persona_reply"), 30*time.Second)
 		defer cancel()
 		text, err := gen.Complete(ctx, p.System, qa.ReplyUser(req.Question, req.Answered))
 		if err != nil {

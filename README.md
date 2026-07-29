@@ -59,6 +59,38 @@ Then:
 
 Flags: `-addr :8090`, `-model qwen2.5:3b`, `-models ./models`, `-data ./data`.
 
+### Observability (optional)
+
+Set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` (and optionally
+`LANGFUSE_HOST`, default Langfuse Cloud) and two things start exporting to
+[Langfuse](https://langfuse.com):
+
+- **the server** traces every classifier turn — question/reply in,
+  intent/clarity/ack out, one session per conversation, tagged with the
+  classifier prompt version;
+- **the eval** publishes each run as a dataset experiment — the 82 labeled cases
+  as a dataset, one run per model, per-case pass/fail plus the aggregate scores.
+  So accuracy becomes history you can chart against prompt versions instead of
+  terminal output that scrolls away.
+
+Langfuse ships no Go SDK; traces go over the official OpenTelemetry Go SDK
+(OTLP/HTTP) and the dataset/score APIs over a small `net/http` client. Unset keys
+= fully offline, zero overhead, and a Langfuse outage can never fail the gate.
+
+A local instance is already set up at `~/projects/langfuse-local` (UI on
+**http://localhost:3001**). Bring it up and use the wrapper, which exports the
+keys and fails fast if it isn't running:
+
+```bash
+cd ~/projects/langfuse-local && docker compose up -d
+cd -   # back to poc
+./scripts/with-langfuse.sh go run ./cmd/server
+./scripts/with-langfuse.sh go run ./cmd/eval -run my-experiment
+```
+
+Details, including the port remaps and headless key provisioning, are in
+`internal/obs` and `VALIDATION.md`.
+
 ## What's verified (and how)
 
 Run these yourself:
