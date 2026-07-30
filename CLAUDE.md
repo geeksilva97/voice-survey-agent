@@ -39,8 +39,9 @@ the full reasoning and `docs/ARCHITECTURE.md §4` for the implementation.
 - 🔌 **Dev server runs on `:8090`.** (The Playwright suite uses its own `:8091`.)
 - 🚫 **Gitignored:** `data/`, `models/`, `bin/`, `*.wav`. Never commit these.
 - 📦 **Commit/push only when explicitly asked.** Work on a branch, PR to `main`.
-  Commit messages end with a `Claude-Session:` trailer; PR bodies end with the
-  session link.
+  **No Claude attribution in commits or PRs** — no `Claude-Session:` trailer, no
+  session link, no "generated with" footer. Commit messages and PR bodies describe
+  the change and nothing else.
 
 ---
 
