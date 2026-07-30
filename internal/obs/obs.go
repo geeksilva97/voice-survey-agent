@@ -194,6 +194,39 @@ func setPromptAttrs(span trace.Span, r prompt.Resolved) {
 	}
 }
 
+// startSpan is the ONE place a span is created, so the rules below hold everywhere.
+//
+// The trace-name guard is what makes nesting work. `langfuse.trace.name` and
+// `langfuse.session.id` are TRACE-level attributes: Langfuse applies them to the
+// whole trace no matter which span carries them. Before spans nested, every
+// operation was its own root trace and setting the name on each was correct. Now a
+// child that set it would rename the entire conversation after whichever leaf wrote
+// last — so only a span that actually begins a new trace claims the name.
+func startSpan(ctx context.Context, name, obsType string) (context.Context, trace.Span) {
+	root := !trace.SpanContextFromContext(ctx).IsValid()
+	ctx, span := otel.Tracer("voicesurvey").Start(ctx, name)
+	span.SetAttributes(attribute.String("langfuse.observation.type", obsType))
+	if root {
+		span.SetAttributes(attribute.String("langfuse.trace.name", name))
+	}
+	if sid := sessionID(ctx); sid != "" {
+		span.SetAttributes(attribute.String("langfuse.session.id", sid))
+	}
+	return ctx, span
+}
+
+// StartScope begins a span that PARENTS the operations that follow it, and returns
+// the context carrying it. This is the difference between a session you can read and
+// 21 unrelated single-span traces in a flat list: pass the returned context down and
+// every stt/classify/tts nests underneath instead of starting its own trace.
+//
+// The caller owns the returned Operation and must End it — a scope that outlives the
+// process is never exported at all.
+func StartScope(ctx context.Context, name string) (*Operation, context.Context) {
+	ctx, span := startSpan(ctx, name, "span")
+	return &Operation{span: span}, ctx
+}
+
 // TraceCompleter wraps an llm.Completer so one-shot generations (the greeting
 // reply, the closing sign-off, the results insight pass) show up as generations
 // in Langfuse. Like TraceClassifier it is a pure pass-through: the text and the
@@ -209,7 +242,7 @@ type tracedCompleter struct {
 
 func (t *tracedCompleter) Complete(ctx context.Context, system, user string) (string, error) {
 	name := label(ctx, "completion")
-	ctx, span := otel.Tracer("voicesurvey").Start(ctx, name)
+	ctx, span := startSpan(ctx, name, "generation")
 	defer span.End()
 	if ref := traceRef(ctx); ref != nil {
 		if sc := span.SpanContext(); sc.HasTraceID() {
@@ -220,14 +253,9 @@ func (t *tracedCompleter) Complete(ctx context.Context, system, user string) (st
 	input, _ := json.Marshal(map[string]string{"system": system, "user": user})
 	span.SetAttributes(
 		attribute.String("gen_ai.request.model", t.model),
-		attribute.String("langfuse.observation.type", "generation"),
 		attribute.String("langfuse.observation.model.name", t.model),
 		attribute.String("langfuse.observation.input", string(input)),
-		attribute.String("langfuse.trace.name", name),
 	)
-	if sid := sessionID(ctx); sid != "" {
-		span.SetAttributes(attribute.String("langfuse.session.id", sid))
-	}
 	if r, ok := tracedPrompt(ctx); ok {
 		setPromptAttrs(span, r)
 	}
@@ -253,14 +281,7 @@ type Operation struct{ span trace.Span }
 
 // StartOp begins a traced operation. Call End when it finishes.
 func StartOp(ctx context.Context, name string) *Operation {
-	_, span := otel.Tracer("voicesurvey").Start(ctx, name)
-	span.SetAttributes(
-		attribute.String("langfuse.observation.type", "span"),
-		attribute.String("langfuse.trace.name", name),
-	)
-	if sid := sessionID(ctx); sid != "" {
-		span.SetAttributes(attribute.String("langfuse.session.id", sid))
-	}
+	_, span := startSpan(ctx, name, "span")
 	return &Operation{span: span}
 }
 
@@ -333,7 +354,7 @@ type tracedClassifier struct {
 }
 
 func (t *tracedClassifier) ClassifyTurn(ctx context.Context, question, reply string) (llm.Turn, error) {
-	ctx, span := otel.Tracer("voicesurvey").Start(ctx, "classify_turn")
+	ctx, span := startSpan(ctx, "classify_turn", "generation")
 	defer span.End()
 	if ref := traceRef(ctx); ref != nil {
 		if sc := span.SpanContext(); sc.HasTraceID() {
@@ -344,17 +365,12 @@ func (t *tracedClassifier) ClassifyTurn(ctx context.Context, question, reply str
 	input, _ := json.Marshal(map[string]string{"question": question, "reply": reply})
 	span.SetAttributes(
 		attribute.String("gen_ai.request.model", t.model),
-		attribute.String("langfuse.observation.type", "generation"),
 		attribute.String("langfuse.observation.model.name", t.model),
 		attribute.String("langfuse.observation.input", string(input)),
-		attribute.String("langfuse.trace.name", "classify_turn"),
 	)
 	// Which prompt produced this decision. Filter/group by it in Langfuse to see
 	// whether a score moved because of a prompt edit.
 	setPromptAttrs(span, llm.ClassifyPrompt.Resolve())
-	if sid := sessionID(ctx); sid != "" {
-		span.SetAttributes(attribute.String("langfuse.session.id", sid))
-	}
 	ec, isEval := evalCase(ctx)
 	if isEval {
 		span.SetAttributes(
