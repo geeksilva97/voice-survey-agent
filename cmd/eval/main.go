@@ -148,6 +148,14 @@ func main() {
 	}
 	fmt.Printf("prompts: %s\n", promptDesc)
 
+	// Check the corpus against the ACTIVE prompt's anchors before spending a single
+	// model call. A leaked sentence makes every number below meaningless, so this
+	// fails the run rather than warning.
+	if ls := fewShotLeaks(dataset); len(ls) > 0 {
+		fmt.Fprint(os.Stderr, reportLeaks(ls))
+		os.Exit(1)
+	}
+
 	names := splitCSV(*models)
 	if len(names) == 0 {
 		fmt.Fprintln(os.Stderr, "no models given")

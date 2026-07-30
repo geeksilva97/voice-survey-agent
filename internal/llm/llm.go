@@ -275,6 +275,34 @@ func classifyMessages() []prompt.Msg {
 	return append(msgs, prompt.Msg{Role: "user", Content: "Question: {{question}}\nReply: {{reply}}"})
 }
 
+// ClassifyShotExamples returns the (question, reply) pairs carried by the ACTIVE
+// classifier prompt's few-shot anchors — every user turn except the final
+// templated one.
+//
+// Exported so cmd/eval can check its corpus does not overlap them. A dataset
+// sentence reused as an anchor leaks the test set and inflates the score, and now
+// that the prompt can be authored in a UI, that mistake no longer passes through
+// code review on its way in.
+//
+// A shot that doesn't follow the "Question: …\nReply: …" shape (possible once a
+// human is editing) yields the whole message as the reply, so the leak check still
+// sees the text rather than skipping it.
+func ClassifyShotExamples() [][2]string {
+	var out [][2]string
+	for _, m := range ClassifyPrompt.Resolve().Chat() {
+		if m.Role != "user" || strings.Contains(m.Content, "{{") {
+			continue // the final templated turn, not an anchor
+		}
+		body := strings.TrimPrefix(m.Content, "Question: ")
+		if i := strings.Index(body, "\nReply: "); i >= 0 {
+			out = append(out, [2]string{body[:i], body[i+len("\nReply: "):]})
+			continue
+		}
+		out = append(out, [2]string{"", m.Content})
+	}
+	return out
+}
+
 // classifyPrompt returns the shared system prompt and the conversation messages
 // (few-shot exchanges + the final user turn) for one classification. Keeping it
 // in one place means every model is judged on the exact same instructions.
@@ -290,21 +318,21 @@ func classifyPrompt(question, reply string) (system string, msgs []Msg) {
 // classifyShots are the few-shot anchors — the part of the prompt that does the
 // heavy lifting on a 3B model, where prose instructions alone don't hold.
 var classifyShots = []prompt.Msg{
-	{Role: "user", Content: "Question: Is there a specific type of drink you would like us to offer more often?\nReply: A banana vitamin would be awesome."},
+	{Role: "user", Content: "Question: Is there a specific type of drink you would like us to offer more often?\nReply: For me the aroma is very discrete, I prefer something more strong."},
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
-	{Role: "user", Content: "Question: What's one thing you'd improve at our coffee shop?\nReply: I don't know, maybe better chairs I guess"},
-	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Comfier seating — good call."}`},
-	{Role: "user", Content: "Question: What's one thing you'd like to see improved at our coffee shop?\nReply: Nothing that comes to my mind actually."},
+	{Role: "user", Content: "Question: What's one thing you'd improve at our coffee shop?\nReply: Not sure, possibly a bigger menu board would help"},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"A clearer menu board — good call."}`},
+	{Role: "user", Content: "Question: What's one thing you'd like to see improved at our coffee shop?\nReply: Honestly nothing springs to mind right now."},
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, got it."}`},
-	{Role: "user", Content: "Question: How was the service?\nReply: The waiter was very educated and gentle with us."},
+	{Role: "user", Content: "Question: How was the service?\nReply: The staff attended us very well, they were very gentle."},
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
-	{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Sorry, what was the question?"},
+	{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Hang on, my connection cut out — what was that?"},
 	{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear","ack":""}`},
-	{Role: "user", Content: "Question: How would you rate the quality of our coffee?\nReply: Do you expect some score or something?"},
+	{Role: "user", Content: "Question: How would you rate the quality of our coffee?\nReply: Are you after a rating out of five here?"},
 	{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"No need for a score — just your honest gut feeling."}`},
-	{Role: "user", Content: "Question: What's one thing you'd improve about our candles?\nReply: Hmm, I'm not really sure what you're looking for here."},
+	{Role: "user", Content: "Question: What's one thing you'd improve about our candles?\nReply: Sorry, I'm not clear what sort of answer helps you."},
 	{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"However you'd like to answer is fine — big or small."}`},
-	{Role: "user", Content: "Question: What could we improve about the app?\nReply: No, I can't think of anything right now."},
+	{Role: "user", Content: "Question: What could we improve about the app?\nReply: No, nothing I'd change at the moment."},
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, noted."}`},
 	{Role: "user", Content: "Question: How has our app been working for you lately?\nReply: Eh, I dunno, it's, like, mostly fine I guess, you know?"},
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Mostly smooth — good to hear."}`},
@@ -312,13 +340,13 @@ var classifyShots = []prompt.Msg{
 	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
 	{Role: "user", Content: "Question: How likely are you to recommend us?\nReply: I really have to run now, sorry."},
 	{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear","ack":""}`},
-	{Role: "user", Content: "Question: What's your favorite scent?\nReply: What time do you close today?"},
+	{Role: "user", Content: "Question: What's your favorite scent?\nReply: Sorry, is your shop open on Sundays?"},
 	{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"No worries —"}`},
 	{Role: "user", Content: "Question: How often do you burn candles at home?\nReply: Did you catch the game last night?"},
 	{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"Ha, no worries —"}`},
-	{Role: "user", Content: "Question: What do you think of our candles?\nReply: (buzzing) (buzzing)"},
+	{Role: "user", Content: "Question: What do you think of our candles?\nReply: (static) (static)"},
 	{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
-	{Role: "user", Content: "Question: How satisfied are you with the quality of our furniture?\nReply: (coughing)"},
+	{Role: "user", Content: "Question: How satisfied are you with the quality of our furniture?\nReply: (sneezes)"},
 	{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
 }
 
