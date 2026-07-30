@@ -132,8 +132,30 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request) {
 	// Base context for the whole session, tagged with a per-run id so traces
 	// (when Langfuse tracing is on) group one conversation per session.
 	ctx := obs.WithSession(context.Background(), fmt.Sprintf("%s-%d", poll.ID, time.Now().Unix()))
-	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey, ctx: ctx}
+
+	// One span for the whole call, and every operation below nests under it. Without
+	// this parent each stt/classify/tts is its own root trace, and a session reads as
+	// a flat list of ~20 unrelated single-span traces instead of one conversation.
+	// The transcript and end reason land on it when it closes, so the top-level view
+	// answers "what happened on this call?" without expanding anything.
+	scope, ctx := obs.StartScope(ctx, "conversation")
+	scope.In(poll.Product)
+
+	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey, ctx: ctx, scope: scope}
 	conv.run()
+
+	scope.Out(scopeSummary(poll, conv.sv)).End()
+}
+
+// scopeSummary renders what the conversation span carries as its output: how it
+// ended plus the transcript it captured.
+func scopeSummary(poll *session.Poll, sv *survey.Survey) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "end_reason: %s\n\n", poll.EndReason)
+	for _, q := range sv.Questions {
+		fmt.Fprintf(&b, "Q: %s\nA: %s (%s)\n", q.Text, strings.TrimSpace(q.Answer), q.Status)
+	}
+	return b.String()
 }
 
 // conversation drives one respondent session.
@@ -142,7 +164,12 @@ type conversation struct {
 	poll *session.Poll
 	c    *websocket.Conn
 	sv   *survey.Survey
-	ctx  context.Context // session-scoped base context (carries the trace session id)
+	ctx  context.Context // session-scoped base context (carries the session id AND the conversation span)
+
+	// scope is the conversation-level span every operation nests under. Always
+	// non-nil; a no-op when tracing is off.
+	scope *obs.Operation
+	turns int // completed utterances, so each turn span gets a readable name
 
 	speaking      bool // true while we expect the client to be playing audio
 	strikes       int  // consecutive silence nudges
@@ -252,11 +279,25 @@ func (cv *conversation) run() {
 // handleUtterance transcribes a reply, classifies it, updates the survey, and
 // speaks the next thing. Returns true when the conversation has ended.
 func (cv *conversation) handleUtterance(pcm []byte) bool {
+	// One span per turn, so a session reads as conversation → turn → the STT,
+	// classify and TTS work that turn did. Scoped to this function via defer, and
+	// restored afterwards so the next turn parents off the conversation rather than
+	// nesting inside its predecessor.
+	cv.turns++
+	base := cv.ctx
+	turnSpan, ctx := obs.StartScope(base, fmt.Sprintf("turn %d", cv.turns))
+	cv.ctx = ctx
+	defer func() {
+		cv.ctx = base
+		turnSpan.End()
+	}()
+
 	// STT latency is dead air on a live call and is invisible in the LLM spans,
 	// so it gets its own traced operation.
 	stt := obs.StartOp(cv.ctx, "stt").Bytes("audio.pcm_bytes", len(pcm))
 	text := cv.h.Speech.Transcribe(pcm, inputSampleRate)
 	stt.Out(text).End()
+	turnSpan.In(text)
 	cv.send(outMsg{Type: "transcript", Text: text})
 
 	// The opening small-talk reply is handled separately — it's not a survey slot.
