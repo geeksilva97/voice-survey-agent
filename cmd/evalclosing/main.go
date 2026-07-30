@@ -79,7 +79,20 @@ func main() {
 	runName := flag.String("run", "", "name for this run in Langfuse (default: <prompt-version>-<unix>)")
 	dataset := flag.String("langfuse-dataset", "closing-line", "Langfuse dataset name")
 	pepitaEnv := flag.String("pepita-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from for Anthropic models")
+	promptMode := flag.String("prompts", "code", "prompt source: 'code' (compiled-in) or 'langfuse' (score the prompt Langfuse serves)")
+	promptLabel := flag.String("prompt-label", "production", "Langfuse label to resolve when -prompts=langfuse")
 	flag.Parse()
+
+	// Resolve the prompt source BEFORE ClosingPromptVersion is read for the run
+	// name, so the run is labeled with the prompt it actually scored.
+	promptCtx, promptCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	promptDesc, err := obs.SetupPrompts(promptCtx, *promptMode, *promptLabel)
+	promptCancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-prompts: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("prompts: %s\n", promptDesc)
 
 	var key string
 	if llm.IsAnthropicModel(*model) {
@@ -180,15 +193,18 @@ func generateOne(closer llm.Completer, c closingCase, run, promptVer string) res
 		return r
 	}
 
+	// Resolve through the handle, exactly as production does: with -prompts=langfuse
+	// this scores the prompt Langfuse is serving, not the one compiled in.
+	p := ws.ResolveClosing(qaProduct, r.transcript)
 	ctx := obs.WithLabel(context.Background(), "closing_line")
-	ctx = obs.WithPromptVersion(ctx, promptVer)
+	ctx = obs.WithPrompt(ctx, p)
 	ctx = obs.WithEvalCase(ctx, obs.EvalCase{Run: run, ExpectedIntent: "clean_opener"})
 	var ref obs.TraceRef
 	ctx = obs.WithTraceRef(ctx, &ref)
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	raw, err := closer.Complete(ctx, ws.ClosingSystem, ws.ClosingUserPrompt(qaProduct, r.transcript))
+	raw, err := closer.Complete(ctx, p.System(), p.LastUser())
 	r.traceID = ref.ID()
 	if err != nil {
 		r.err = err

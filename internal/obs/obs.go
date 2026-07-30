@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/prompt"
 )
 
 const defaultHost = "https://cloud.langfuse.com"
@@ -154,21 +155,43 @@ func label(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-// promptVersionKey carries the fingerprint of the prompt driving the next traced
-// call. The classifier stamps its own version directly (it has exactly one
-// prompt); completions are generic, so the call site supplies theirs.
-type promptVersionKey struct{}
+// promptKey carries the prompt driving the next traced call. The classifier
+// stamps its own directly (it has exactly one prompt); completions are generic,
+// so the call site supplies theirs.
+type promptKey struct{}
 
-// WithPromptVersion records which prompt version produced the next traced
-// completion. Without it a prompt edit is invisible in Langfuse: old and new
-// output land in one undifferentiated pile with no axis to split them.
-func WithPromptVersion(ctx context.Context, version string) context.Context {
-	return context.WithValue(ctx, promptVersionKey{}, version)
+// WithPrompt records WHICH prompt produced the next traced completion. Without
+// it a prompt edit is invisible in Langfuse: old and new output land in one
+// undifferentiated pile with no axis to split them.
+func WithPrompt(ctx context.Context, r prompt.Resolved) context.Context {
+	return context.WithValue(ctx, promptKey{}, r)
 }
 
-func promptVersion(ctx context.Context) string {
-	v, _ := ctx.Value(promptVersionKey{}).(string)
-	return v
+func tracedPrompt(ctx context.Context) (prompt.Resolved, bool) {
+	r, ok := ctx.Value(promptKey{}).(prompt.Resolved)
+	return r, ok
+}
+
+// setPromptAttrs records the prompt's identity on a generation span, two ways.
+//
+// The fingerprint always goes on as metadata: it is the only identity that exists
+// in ModeCode, and it is content-addressed, so it can't drift. When the prompt
+// came from Langfuse we ALSO set the native link attributes, which is what makes
+// the generation show up attached to the managed prompt in the UI (and gives the
+// per-version metrics for free). Prompt linking only works on generation-type
+// observations, which every call site here is.
+func setPromptAttrs(span trace.Span, r prompt.Resolved) {
+	span.SetAttributes(
+		attribute.String("langfuse.trace.metadata.prompt_name", r.Name),
+		attribute.String("langfuse.trace.metadata.prompt_source", r.Source),
+		attribute.String("langfuse.trace.metadata.prompt_version", r.Fingerprint()),
+	)
+	if r.Version > 0 {
+		span.SetAttributes(
+			attribute.String("langfuse.observation.prompt.name", r.Name),
+			attribute.Int("langfuse.observation.prompt.version", r.Version),
+		)
+	}
 }
 
 // TraceCompleter wraps an llm.Completer so one-shot generations (the greeting
@@ -205,8 +228,8 @@ func (t *tracedCompleter) Complete(ctx context.Context, system, user string) (st
 	if sid := sessionID(ctx); sid != "" {
 		span.SetAttributes(attribute.String("langfuse.session.id", sid))
 	}
-	if pv := promptVersion(ctx); pv != "" {
-		span.SetAttributes(attribute.String("langfuse.trace.metadata.prompt_version", pv))
+	if r, ok := tracedPrompt(ctx); ok {
+		setPromptAttrs(span, r)
 	}
 
 	out, err := t.inner.Complete(ctx, system, user)
@@ -325,10 +348,10 @@ func (t *tracedClassifier) ClassifyTurn(ctx context.Context, question, reply str
 		attribute.String("langfuse.observation.model.name", t.model),
 		attribute.String("langfuse.observation.input", string(input)),
 		attribute.String("langfuse.trace.name", "classify_turn"),
-		// Which prompt produced this decision. Filter/group by it in Langfuse to
-		// see whether a score moved because of a prompt edit.
-		attribute.String("langfuse.trace.metadata.prompt_version", llm.ClassifyPromptVersion()),
 	)
+	// Which prompt produced this decision. Filter/group by it in Langfuse to see
+	// whether a score moved because of a prompt edit.
+	setPromptAttrs(span, llm.ClassifyPrompt.Resolve())
 	if sid := sessionID(ctx); sid != "" {
 		span.SetAttributes(attribute.String("langfuse.session.id", sid))
 	}
