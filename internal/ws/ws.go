@@ -133,29 +133,8 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request) {
 	// (when Langfuse tracing is on) group one conversation per session.
 	ctx := obs.WithSession(context.Background(), fmt.Sprintf("%s-%d", poll.ID, time.Now().Unix()))
 
-	// One span for the whole call, and every operation below nests under it. Without
-	// this parent each stt/classify/tts is its own root trace, and a session reads as
-	// a flat list of ~20 unrelated single-span traces instead of one conversation.
-	// The transcript and end reason land on it when it closes, so the top-level view
-	// answers "what happened on this call?" without expanding anything.
-	scope, ctx := obs.StartScope(ctx, "conversation")
-	scope.In(poll.Product)
-
-	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey, ctx: ctx, scope: scope}
+	conv := &conversation{h: h, poll: poll, c: c, sv: poll.Survey, ctx: ctx}
 	conv.run()
-
-	scope.Out(scopeSummary(poll, conv.sv)).End()
-}
-
-// scopeSummary renders what the conversation span carries as its output: how it
-// ended plus the transcript it captured.
-func scopeSummary(poll *session.Poll, sv *survey.Survey) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "end_reason: %s\n\n", poll.EndReason)
-	for _, q := range sv.Questions {
-		fmt.Fprintf(&b, "Q: %s\nA: %s (%s)\n", q.Text, strings.TrimSpace(q.Answer), q.Status)
-	}
-	return b.String()
 }
 
 // conversation drives one respondent session.
@@ -166,10 +145,8 @@ type conversation struct {
 	sv   *survey.Survey
 	ctx  context.Context // session-scoped base context (carries the session id AND the conversation span)
 
-	// scope is the conversation-level span every operation nests under. Always
-	// non-nil; a no-op when tracing is off.
-	scope *obs.Operation
-	turns int // completed utterances, so each turn span gets a readable name
+	turns int      // utterances so far, so each turn span gets a readable name
+	said  []string // what the agent spoke during the current turn (for the turn span's output)
 
 	speaking      bool // true while we expect the client to be playing audio
 	strikes       int  // consecutive silence nudges
@@ -279,17 +256,22 @@ func (cv *conversation) run() {
 // handleUtterance transcribes a reply, classifies it, updates the survey, and
 // speaks the next thing. Returns true when the conversation has ended.
 func (cv *conversation) handleUtterance(pcm []byte) bool {
-	// One span per turn, so a session reads as conversation → turn → the STT,
-	// classify and TTS work that turn did. Scoped to this function via defer, and
-	// restored afterwards so the next turn parents off the conversation rather than
-	// nesting inside its predecessor.
+	// One span per turn, and the STT / classify / TTS work nests inside it. That is
+	// what keeps a session readable: each turn is ONE card showing what the
+	// respondent said and what the agent said back, and the classifier's JSON sits
+	// inside the turn rather than interleaved between speech as its own entry.
+	//
+	// Deliberately NOT parented to a conversation-level span: a single root would
+	// collapse the whole call into one card and lose the per-turn separation.
+	// Restored via defer so the next turn is a sibling, not a child of its predecessor.
 	cv.turns++
 	base := cv.ctx
 	turnSpan, ctx := obs.StartScope(base, fmt.Sprintf("turn %d", cv.turns))
 	cv.ctx = ctx
+	cv.said = nil
 	defer func() {
 		cv.ctx = base
-		turnSpan.End()
+		turnSpan.Out(strings.Join(cv.said, " ")).End()
 	}()
 
 	// STT latency is dead air on a live call and is invisible in the LLM spans,
@@ -980,6 +962,9 @@ func (cv *conversation) emit(msg outMsg, ttsText string) {
 // binary frame. It does NOT bracket the turn (no tts_end) — callers that build
 // multi-beat turns (speakPaced) stream several segments before one tts_end.
 func (cv *conversation) streamTTS(text string) {
+	// Every spoken segment funnels through here, so this is the one place that can
+	// reconstruct what the agent said this turn for the turn span's output.
+	cv.said = append(cv.said, text)
 	for _, chunk := range splitSentences(text) {
 		tts := obs.StartOp(cv.ctx, "tts").In(chunk)
 		wav, err := cv.h.Speech.Synthesize(chunk)
