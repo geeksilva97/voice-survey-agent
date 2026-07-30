@@ -666,6 +666,51 @@ dumped at runtime on this branch and on `main` and compared byte-for-byte:
 Corroborated by the gate: the intent eval reports **95.1% / 95.7%** — the same
 numbers as the pre-refactor baseline recorded above.
 
+### Few-shot test-set leak guard (`cmd/eval/leak.go`)
+
+The classifier prompt's few-shot anchors and the eval corpus must stay disjoint. An
+anchor repeating a corpus sentence hands the model the answer to a case it is about
+to be graded on: accuracy rises, the classifier does not improve, and the number
+quietly stops meaning anything.
+
+`EVAL.md` had carried this rule since it bit us once, but enforcement was a human
+reading a diff. Prompt management removed that backstop — an anchor authored in the
+Langfuse UI reaches production without a code review — so the rule is now executable:
+
+- `TestNoLeakInCompiledPrompt` runs under `go test ./...`, so the **gate** catches a
+  leak introduced in Go, offline, with no credentials.
+- `cmd/eval` re-runs the same check against the **active** prompt after resolving
+  `-prompts`, and exits before the first model call. That is the half that covers a
+  Langfuse-authored anchor.
+- Matching is on normalized replies (lowercased, punctuation stripped, apostrophes
+  removed) so casing and punctuation can't disguise a reused sentence. Exact matches
+  are reported at any length; containment needs ≥20 normalized characters, because
+  short replies ("Yeah.", "Vanilla.") legitimately recur across a corpus about
+  opinions and flagging them would train people to ignore the check.
+
+**It found 11 pre-existing leaks on its first run** — 11 of the 15 anchors repeated a
+corpus sentence verbatim, so `EVAL.md`'s claim that the anchors were "intentionally
+novel sentences" was not true. The cause is benign and will recur: fixing the cough
+bug meant adding `(coughing)` to the prompt *to teach the model* and to the corpus
+*to lock the fix*.
+
+Measured impact, before the fix:
+
+| Group | Accuracy |
+|---|---|
+| the 11 leaked cases | **11/11 — 100%** |
+| the other 71 cases | **67/71 — 94.4%** |
+| all 82 (what was reported) | **78/82 — 95.1%** |
+
+Fixed by rewriting the 11 **anchors** as novel sentences teaching the same lesson
+(prompt now says `(sneezes)`, corpus keeps `(coughing)`), leaving the corpus untouched
+because those cases are regression anchors for real bugs.
+
+**After the fix the gate reports `acc 95.1%, answer 97.8%`** — accuracy held and the
+answer rate rose from 95.7%, which is the reassuring outcome: the anchors were
+teaching the intent classes, not memorizing the corpus. Removing the overlap cost
+nothing and the number is now honest.
+
 **What the tests cover** (`go test ./...`, no credentials needed):
 
 - `internal/prompt` — `{{var}}` substitution incl. `{{ spaced }}`, unknown

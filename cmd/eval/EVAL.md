@@ -215,8 +215,23 @@ Implementation and the API constraints it works around are in `internal/obs`.
   — it should fail, then pass once the prompt/guard is fixed.
 
 - **Never reuse a dataset sentence as a few-shot** in the classifier prompt — that
-  leaks the test set and inflates the score. (We hit this once; the anchors in the
-  prompt are intentionally novel sentences.)
+  leaks the test set and inflates the score. **This is now enforced, not advisory**
+  (`leak.go`): `TestNoLeakInCompiledPrompt` fails the gate, and the eval itself exits
+  before spending a model call if the *active* prompt overlaps the corpus. The check
+  runs against whichever prompt is installed, so it also covers an anchor authored in
+  the Langfuse UI, which never passes through code review on its way in.
+
+  The rule used to say the anchors were "intentionally novel sentences". They weren't:
+  when the check was written it found **11 of 15 anchors repeating a corpus sentence
+  verbatim**. The cause is benign and worth knowing, because it will happen again —
+  fixing the cough bug meant adding `(coughing)` to the prompt (to teach the model)
+  *and* to the corpus (to lock the fix). Same sentence, both places.
+
+  Measured before the fix: leaked cases scored **11/11 (100%)** against **67/71
+  (94.4%)** on the rest, so the reported 95.1% was carrying 11 gimmes. The anchors
+  were rewritten as novel sentences that teach the same lesson (prompt says
+  `(sneezes)`, corpus keeps `(coughing)`) and the corpus was left untouched, since
+  those cases are regression anchors for real bugs.
 
 - **If you raise a threshold**, confirm the local gate model still clears it —
   otherwise every CI run fails offline.
