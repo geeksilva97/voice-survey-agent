@@ -133,7 +133,20 @@ func main() {
 	judgeModel := flag.String("judge", "claude-sonnet-5", "model that judges acknowledgment quality (ungated); empty to skip")
 	runName := flag.String("run", "", "name for this eval run in Langfuse (default: <prompt-version>-<unix>); requires LANGFUSE_* env vars")
 	lfDataset := flag.String("langfuse-dataset", "turn-classifier", "Langfuse dataset name the corpus is pushed to")
+	promptMode := flag.String("prompts", "code", "prompt source: 'code' (compiled-in) or 'langfuse' (score the prompt Langfuse serves)")
+	promptLabel := flag.String("prompt-label", "production", "Langfuse label to resolve when -prompts=langfuse")
 	flag.Parse()
+
+	// Resolve the prompt source BEFORE anything reads a prompt version, so the run
+	// name and every span describe the prompt actually being scored.
+	promptCtx, promptCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	promptDesc, err := obs.SetupPrompts(promptCtx, *promptMode, *promptLabel)
+	promptCancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-prompts: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("prompts: %s\n", promptDesc)
 
 	names := splitCSV(*models)
 	if len(names) == 0 {

@@ -16,6 +16,7 @@ import (
 	"voicesurvey/internal/insight"
 	"voicesurvey/internal/llm"
 	"voicesurvey/internal/obs"
+	"voicesurvey/internal/prompt"
 	"voicesurvey/internal/qa"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
@@ -34,6 +35,8 @@ func main() {
 	agentName := flag.String("agent-name", "Ava", "the voice agent's name (used in the spoken greetings)")
 	pacing := flag.Bool("pacing", true, "deliver each question as two beats — a short acknowledgment, a brief pause, then the question — instead of one breath")
 	qaFlag := flag.Bool("qa", false, "mount the DEV-ONLY persona QA endpoint (POST /api/qa/reply) for browser E2E testing; never enable in production")
+	promptMode := flag.String("prompts", string(prompt.ModeCode), "where prompts come from: 'code' (compiled-in, offline, what validate.sh gates) or 'langfuse' (fetched once at boot from Langfuse Prompt Management)")
+	promptLabel := flag.String("prompt-label", obs.DefaultPromptLabel, "Langfuse label to resolve when -prompts=langfuse")
 	anthropicEnv := flag.String("anthropic-env", llm.DefaultAnthropicEnvFile(), "file to read ANTHROPIC_API_KEY from if unset in env (for Anthropic classify/insight models)")
 	flag.Parse()
 
@@ -112,6 +115,20 @@ func main() {
 			_ = obsShutdown(ctx)
 		}()
 	}
+
+	// Prompt source. In 'langfuse' mode every prompt is fetched ONCE here and
+	// installed over the compiled-in default; nothing is fetched again for the
+	// life of the process, so a prompt edit can never add latency to a live voice
+	// turn. A failure here is fatal on purpose: silently serving the old prompt
+	// while you believe you're testing the new one is the one outcome that makes
+	// the experiment worthless.
+	promptCtx, promptCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	promptDesc, err := obs.SetupPrompts(promptCtx, *promptMode, *promptLabel)
+	promptCancel()
+	if err != nil {
+		log.Fatalf("-prompts: %v", err)
+	}
+	log.Printf("prompts: %s", promptDesc)
 
 	log.Printf("question-gen model: %s | classify model: %s | insight model: %s", *ollamaModel, cm, *insightModel)
 
@@ -233,7 +250,11 @@ func (a *app) getInsights(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(obs.WithLabel(r.Context(), "insight_scoring"), 120*time.Second)
+	// Stamp the scoring prompt on the trace. The resolved prompt is wired here
+	// rather than inside package insight so insight keeps its single dependency
+	// (llm) and stays usable without the observability layer.
+	ctx := obs.WithPrompt(obs.WithLabel(r.Context(), "insight_scoring"), insight.ScorePrompt.Resolve())
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	res, err := insight.Score(ctx, a.insightLLM, a.insightModel, in)
 	if err != nil {

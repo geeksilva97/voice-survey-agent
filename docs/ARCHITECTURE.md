@@ -29,6 +29,7 @@ flowchart LR
     SURVEY["survey state machine<br/>(internal/survey)"]
     SPEECH["speech engine<br/>(internal/speech → sherpa-onnx)"]
     LLM["LLM client<br/>(internal/llm)"]
+    PROMPTS["prompt registry<br/>(internal/prompt)"]
     STORE["session store + JSON<br/>(internal/session)"]
   end
 
@@ -37,6 +38,7 @@ flowchart LR
   COND --> SPEECH
   COND --> LLM
   COND --> STORE
+  LLM --> PROMPTS
   LLM <--> OLLAMA["Ollama<br/>qwen2.5:3b"]
   SPEECH <--> MODELS[("Whisper base.en<br/>Kokoro-82M")]
 ```
@@ -258,5 +260,24 @@ reloading `/poll/<id>` re-takes it (used by the Restart button).
 | `maxSilenceStrikes` | `ws.go` | 2 | nudges before ending on silence |
 | `maxFollowUps` | `survey.go` | 1 | clarifying probes per question |
 | Kokoro voice id | `speech.go` | 0 | agent voice |
+| `-prompts` | `cmd/server` | `code` | where the five LLM prompts come from: the binary, or Langfuse Prompt Management |
+
+## 7. Where the prompts live
+
+Every LLM instruction — the turn classifier, question generation, the greeting
+reply, the closing line, the insight pass — is declared once in `internal/prompt`
+and resolved at the call site rather than read from a Go constant.
+
+That single indirection is what lets the active text come from the binary
+(`-prompts=code`, the default: offline, reproducible, what the gate measures) or
+from Langfuse (`-prompts=langfuse`: fetched once at boot, so a prompt edit never
+touches the latency of a live turn).
+
+`internal/prompt` is a **leaf** package — it imports nothing else in the app. That
+is what lets `llm`, `ws` and `insight` all declare their prompts there while `obs`,
+which imports `llm`, installs the Langfuse overrides on top.
+
+See [`PROMPTS.md`](PROMPTS.md) for the workflow, the guarantees, and how a prompt
+version reaches a trace.
 
 See [`VALIDATION.md`](../VALIDATION.md) for how every layer is tested.

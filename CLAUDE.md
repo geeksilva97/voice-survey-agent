@@ -71,6 +71,8 @@ Prereqs: `ollama serve` + `ollama pull qwen2.5:3b`; `./scripts/fetch-models.sh`
 | `-agent-name` | `Ava` | spoken agent name |
 | `-pacing` | `true` | two-beat delivery: ack → pause → question |
 | `-qa` | `false` | mount DEV-ONLY persona endpoint + `qa_intent` channel |
+| `-prompts` | `code` | prompt source: `code` (compiled-in, offline) or `langfuse` (fetched once at boot) |
+| `-prompt-label` | `production` | Langfuse label to resolve when `-prompts=langfuse` |
 
 ---
 
@@ -82,12 +84,14 @@ cmd/
   probe/    drives the whole conversation over WebSocket, no browser/mic (used by validate.sh)
   eval/     scores the turn classifier against a labeled dataset (see cmd/eval/EVAL.md)
   evalclosing/ scores the personalized CLOSING LINE — deterministic only, no judge (see cmd/evalclosing/EVAL.md)
+  prompts/  push/list/show the app's prompts against Langfuse Prompt Management (see docs/PROMPTS.md)
   genclips/ synthesizes fixed answer WAVs for the browser demo (one-off)
   spike/    Phase-0 proof that Kokoro+Whisper load from Go
 internal/
   ws/       WebSocket handler + protocol + the conversation/turn loop (the heart)
   survey/   slot model + state machine + ending logic (owns the ending)
   llm/      Ollama + Anthropic: question-gen, turn classifier, completer
+  prompt/   the prompt registry: every LLM instruction, resolved from code OR Langfuse (leaf pkg, no app deps)
   speech/   sherpa-onnx wrappers: Whisper STT + Kokoro TTS (+ Silence, SynthesizeVoice)
   session/  poll store (in-mem + JSON in data/<id>.json)
   insight/  one-shot results scoring pass
@@ -130,6 +134,9 @@ ending logic all run for real; only the *input device* (mic) is faked.
   bail-early, end-of-turn ≠ end-of-conversation, recommended stack.
 - [docs/PACING-RESEARCH.md](docs/PACING-RESEARCH.md) — turn-gap science and why the
   two-beat pacing (ack → ~400ms silent-PCM pause → question) is built the way it is.
+- [docs/PROMPTS.md](docs/PROMPTS.md) — the two prompt sources (`-prompts=code` vs.
+  `langfuse`), the five registered prompts, why a load failure is fatal while a lost
+  trace isn't, and how a prompt version reaches a span.
 - [docs/BROWSER-QA.md](docs/BROWSER-QA.md) — the fake microphone, the audio
   round-trip, fixed clips vs. LLM personas, the `-qa` endpoint, the `qa_intent`
   channel, and both ways to run it (Chrome MCP + Playwright).
@@ -148,3 +155,7 @@ ending logic all run for real; only the *input device* (mic) is faked.
 - Match surrounding code style; keep comments at the density of the file you edit.
 - Ending logic lives in `internal/survey` and `internal/ws` — the LLM classifies,
   it never decides to hang up. Keep that separation.
+- Every LLM instruction is declared with `prompt.Register` and resolved at the call
+  site via `Handle.Resolve()`. Never reference the prompt text directly and never
+  capture it at init — a Langfuse override installed at boot would be invisible.
+  New prompt ⇒ also import its package in `cmd/prompts`. See `docs/PROMPTS.md`.

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"voicesurvey/internal/llm"
+	"voicesurvey/internal/prompt"
 )
 
 // flexInt/flexFloat tolerate weaker models that quote numbers as strings
@@ -108,6 +109,23 @@ type scored struct {
 	} `json:"answers"`
 }
 
+// ScorePrompt is the results-page scoring pass. Registered (rather than a bare
+// const) so the active version can be served from Langfuse — see package prompt.
+var ScorePrompt = prompt.Register(prompt.Def{
+	Name:        "voicesurvey/insight-score",
+	Description: "Scores a finished survey response as a document: product sentiment, per-answer usefulness and confidence, and a summary. Independent of the per-turn classifier.",
+	Vars:        []string{"product", "endReasonLine", "transcript"},
+	Config:      map[string]any{"output": "json"},
+	Messages: []prompt.Msg{{
+		Role:    "system",
+		Content: system,
+	}, {
+		Role: "user",
+		Content: "Product: {{product}}\n{{endReasonLine}}\nTranscript:\n{{transcript}}\n" +
+			"Return the JSON now.",
+	}},
+})
+
 const system = "You are an analyst scoring a completed VOICE opinion survey. You are given a product " +
 	"and a transcript of questions with the respondent's spoken answers (and each answer's status). " +
 	"Reason about the WHOLE conversation, then score it. Return STRICT JSON only — no prose, no code fences.\n\n" +
@@ -133,8 +151,8 @@ const system = "You are an analyst scoring a completed VOICE opinion survey. You
 func Score(ctx context.Context, c llm.Completer, model string, in Input) (Result, error) {
 	res := baseline(model, in) // safe default we fill in / return on failure
 
-	user := buildPrompt(in)
-	raw, err := c.Complete(ctx, system, user)
+	r := ScorePrompt.Resolve().Compile(promptVars(in))
+	raw, err := c.Complete(ctx, r.System(), r.LastUser())
 	if err != nil {
 		return res, fmt.Errorf("insight: completer failed: %w", err)
 	}
@@ -188,14 +206,11 @@ func Score(ctx context.Context, c llm.Completer, model string, in Input) (Result
 	return res, nil
 }
 
-// buildPrompt renders the transcript as a numbered list the model can score.
-func buildPrompt(in Input) string {
+// promptVars renders the inputs the scoring prompt interpolates. The numbered
+// transcript stays code-side: the numbering is what keys the model's per-answer
+// scores back onto the right question, so it is not a prompt-authoring decision.
+func promptVars(in Input) map[string]string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Product: %s\n", strings.TrimSpace(in.Product))
-	if r := strings.TrimSpace(in.EndReason); r != "" {
-		fmt.Fprintf(&b, "How the survey ended: %s\n", r)
-	}
-	b.WriteString("\nTranscript:\n")
 	for i, qa := range in.Answers {
 		ans := strings.TrimSpace(qa.Answer)
 		if ans == "" {
@@ -203,8 +218,15 @@ func buildPrompt(in Input) string {
 		}
 		fmt.Fprintf(&b, "%d. Q: %s\n   A: %s\n   (status: %s)\n", i+1, strings.TrimSpace(qa.Question), ans, qa.Status)
 	}
-	b.WriteString("\nReturn the JSON now.")
-	return b.String()
+	endReason := ""
+	if r := strings.TrimSpace(in.EndReason); r != "" {
+		endReason = fmt.Sprintf("How the survey ended: %s\n", r)
+	}
+	return map[string]string{
+		"product":       strings.TrimSpace(in.Product),
+		"endReasonLine": endReason,
+		"transcript":    b.String(),
+	}
 }
 
 // parseScored isolates the JSON object (models sometimes wrap it in prose or

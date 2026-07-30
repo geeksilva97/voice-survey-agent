@@ -8,8 +8,6 @@ package llm
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -17,6 +15,8 @@ import (
 	"unicode"
 
 	"github.com/ollama/ollama/api"
+
+	"voicesurvey/internal/prompt"
 )
 
 // Client wraps the Ollama API client and the chosen model.
@@ -85,35 +85,16 @@ type surveyOut struct {
 // respondent. Retries once on malformed JSON. The intro is optional: a missing
 // or oversized one comes back empty so the caller can fall back to a fixed line.
 func (c *Client) GenerateSurvey(ctx context.Context, product, purpose string) (SurveyPlan, error) {
-	sys := "You set up a spoken VOICE opinion survey. You produce two things.\n\n" +
-		"1) INTRO: one warm, natural opening line the agent SAYS OUT LOUD before the " +
-		"first question. Greet the respondent, mention there are just a few quick " +
-		"questions about the product, reassure them there are no wrong answers " +
-		"(you want their honest take), and end with a short hand-off like " +
-		"\"Here's the first:\" or \"Let's start:\". Keep it to 1-2 short sentences, " +
-		"conversational and spoken (contractions are good). Do NOT include any actual " +
-		"question in the intro. Do NOT say a specific number of questions — say " +
-		"\"a few\". No emoji.\n\n" +
-		"2) QUESTIONS: 3 to 5 poll questions, each read aloud and answered by " +
-		"speaking, so each is a single natural conversational sentence. No numbering, " +
-		"no preamble. Ask about the respondent's honest opinion, experience, and " +
-		"suggestions.\n\n" +
-		"CRITICAL: If a SURVEY GOAL is given, the questions MUST focus specifically on " +
-		"that goal — every question should dig into what the goal actually wants to " +
-		"learn. Do NOT drift into generic questions that ignore the goal. Use the " +
-		"concrete details in the product description and goal (specific dishes, " +
-		"features, regions, changes) so the questions are clearly about THIS survey, " +
-		"not any survey.\n\n" +
-		"NEVER use placeholders or brackets like [Name] or [Restaurant Name]; if a " +
-		"specific detail is unknown, phrase things generally (e.g. 'our candles')."
 	goal := strings.TrimSpace(purpose)
 	goalLine := ""
 	if goal != "" {
 		goalLine = fmt.Sprintf("Survey goal (what we most want to learn): %s\n", goal)
 	}
-	user := fmt.Sprintf("Product / topic: %s\n%s\n"+
-		"Respond ONLY as JSON: "+
-		`{"intro": "...", "questions": ["...", "..."]}`, strings.TrimSpace(product), goalLine)
+	r := SurveyPrompt.Resolve().Compile(map[string]string{
+		"product":  strings.TrimSpace(product),
+		"goalLine": goalLine,
+	})
+	sys, user := r.System(), r.LastUser()
 
 	format := json.RawMessage(`{"type":"object","properties":{"intro":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}}},"required":["intro","questions"]}`)
 
@@ -143,6 +124,42 @@ func (c *Client) GenerateSurvey(ctx context.Context, product, purpose string) (S
 	}
 	return SurveyPlan{}, lastErr
 }
+
+// SurveyPrompt generates the question script and the spoken opening line.
+var SurveyPrompt = prompt.Register(prompt.Def{
+	Name:        "voicesurvey/question-gen",
+	Description: "Turns a product description + survey goal into 3-5 spoken-style questions plus a warm opening line. Runs on the local 3B model, so the constraints are deliberately blunt.",
+	Vars:        []string{"product", "goalLine"},
+	Config:      map[string]any{"temperature": 0.4, "output": "json"},
+	Messages: []prompt.Msg{{
+		Role: "system",
+		Content: "You set up a spoken VOICE opinion survey. You produce two things.\n\n" +
+			"1) INTRO: one warm, natural opening line the agent SAYS OUT LOUD before the " +
+			"first question. Greet the respondent, mention there are just a few quick " +
+			"questions about the product, reassure them there are no wrong answers " +
+			"(you want their honest take), and end with a short hand-off like " +
+			"\"Here's the first:\" or \"Let's start:\". Keep it to 1-2 short sentences, " +
+			"conversational and spoken (contractions are good). Do NOT include any actual " +
+			"question in the intro. Do NOT say a specific number of questions — say " +
+			"\"a few\". No emoji.\n\n" +
+			"2) QUESTIONS: 3 to 5 poll questions, each read aloud and answered by " +
+			"speaking, so each is a single natural conversational sentence. No numbering, " +
+			"no preamble. Ask about the respondent's honest opinion, experience, and " +
+			"suggestions.\n\n" +
+			"CRITICAL: If a SURVEY GOAL is given, the questions MUST focus specifically on " +
+			"that goal — every question should dig into what the goal actually wants to " +
+			"learn. Do NOT drift into generic questions that ignore the goal. Use the " +
+			"concrete details in the product description and goal (specific dishes, " +
+			"features, regions, changes) so the questions are clearly about THIS survey, " +
+			"not any survey.\n\n" +
+			"NEVER use placeholders or brackets like [Name] or [Restaurant Name]; if a " +
+			"specific detail is unknown, phrase things generally (e.g. 'our candles').",
+	}, {
+		Role: "user",
+		Content: "Product / topic: {{product}}\n{{goalLine}}\n" +
+			"Respond ONLY as JSON: " + `{"intro": "...", "questions": ["...", "..."]}`,
+	}},
+})
 
 // cleanIntro trims the generated opening line and drops it (returns "") if it's
 // empty or implausibly long, so a rambling small-model intro can't hijack the
@@ -174,11 +191,11 @@ func cleanQuestions(in []string) []string {
 type Intent string
 
 const (
-	IntentAnswer     Intent = "answer"      // engaging with the question
-	IntentWantsStop  Intent = "wants_stop"  // wants to end the survey early
-	IntentRepeat     Intent = "repeat"      // didn't HEAR it; wants the question read again
-	IntentNeedsHelp  Intent = "needs_help"  // heard it but unsure how to answer / asks us to clarify
-	IntentOffTopic   Intent = "off_topic"   // not related to the question
+	IntentAnswer     Intent = "answer"     // engaging with the question
+	IntentWantsStop  Intent = "wants_stop" // wants to end the survey early
+	IntentRepeat     Intent = "repeat"     // didn't HEAR it; wants the question read again
+	IntentNeedsHelp  Intent = "needs_help" // heard it but unsure how to answer / asks us to clarify
+	IntentOffTopic   Intent = "off_topic"  // not related to the question
 	IntentUnintellig Intent = "unintelligible"
 )
 
@@ -237,46 +254,72 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 	})
 }
 
+// ClassifyPrompt is the per-turn classifier's instructions: the system block, the
+// few-shot anchors, and the templated final user turn. Registered rather than
+// referenced directly so the active version can come from Langfuse — see
+// package prompt.
+var ClassifyPrompt = prompt.Register(prompt.Def{
+	Name:        "voicesurvey/classify-turn",
+	Description: "Labels one respondent turn (intent/sufficient/clarity) and writes the spoken ack. The few-shot anchors carry as much of the behavior as the instructions do — edit both together.",
+	Vars:        []string{"question", "reply"},
+	Config:      map[string]any{"temperature": 0, "output": "json"},
+	Messages:    classifyMessages(),
+})
+
+// classifyMessages assembles the registered message list: system, then every
+// few-shot exchange, then the turn under classification.
+func classifyMessages() []prompt.Msg {
+	msgs := make([]prompt.Msg, 0, len(classifyShots)+2)
+	msgs = append(msgs, prompt.Msg{Role: "system", Content: classifySystem})
+	msgs = append(msgs, classifyShots...)
+	return append(msgs, prompt.Msg{Role: "user", Content: "Question: {{question}}\nReply: {{reply}}"})
+}
+
 // classifyPrompt returns the shared system prompt and the conversation messages
 // (few-shot exchanges + the final user turn) for one classification. Keeping it
 // in one place means every model is judged on the exact same instructions.
 func classifyPrompt(question, reply string) (system string, msgs []Msg) {
-	system = classifySystem
-	shots := []Msg{
-		{Role: "user", Content: "Question: Is there a specific type of drink you would like us to offer more often?\nReply: A banana vitamin would be awesome."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
-		{Role: "user", Content: "Question: What's one thing you'd improve at our coffee shop?\nReply: I don't know, maybe better chairs I guess"},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Comfier seating — good call."}`},
-		{Role: "user", Content: "Question: What's one thing you'd like to see improved at our coffee shop?\nReply: Nothing that comes to my mind actually."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, got it."}`},
-		{Role: "user", Content: "Question: How was the service?\nReply: The waiter was very educated and gentle with us."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
-		{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Sorry, what was the question?"},
-		{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear","ack":""}`},
-		{Role: "user", Content: "Question: How would you rate the quality of our coffee?\nReply: Do you expect some score or something?"},
-		{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"No need for a score — just your honest gut feeling."}`},
-		{Role: "user", Content: "Question: What's one thing you'd improve about our candles?\nReply: Hmm, I'm not really sure what you're looking for here."},
-		{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"However you'd like to answer is fine — big or small."}`},
-		{Role: "user", Content: "Question: What could we improve about the app?\nReply: No, I can't think of anything right now."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, noted."}`},
-		{Role: "user", Content: "Question: How has our app been working for you lately?\nReply: Eh, I dunno, it's, like, mostly fine I guess, you know?"},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Mostly smooth — good to hear."}`},
-		{Role: "user", Content: "Question: What would make you shop with us more?\nReply: You should make more advertising, I never see your publicity anywhere."},
-		{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
-		{Role: "user", Content: "Question: How likely are you to recommend us?\nReply: I really have to run now, sorry."},
-		{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear","ack":""}`},
-		{Role: "user", Content: "Question: What's your favorite scent?\nReply: What time do you close today?"},
-		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"No worries —"}`},
-		{Role: "user", Content: "Question: How often do you burn candles at home?\nReply: Did you catch the game last night?"},
-		{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"Ha, no worries —"}`},
-		{Role: "user", Content: "Question: What do you think of our candles?\nReply: (buzzing) (buzzing)"},
-		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
-		{Role: "user", Content: "Question: How satisfied are you with the quality of our furniture?\nReply: (coughing)"},
-		{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
+	r := ClassifyPrompt.Resolve().Compile(map[string]string{"question": question, "reply": reply})
+	system = r.System()
+	for _, m := range r.Chat() {
+		msgs = append(msgs, Msg{Role: m.Role, Content: m.Content})
 	}
-	user := fmt.Sprintf("Question: %s\nReply: %s", question, reply)
-	msgs = append(shots, Msg{Role: "user", Content: user})
 	return system, msgs
+}
+
+// classifyShots are the few-shot anchors — the part of the prompt that does the
+// heavy lifting on a 3B model, where prose instructions alone don't hold.
+var classifyShots = []prompt.Msg{
+	{Role: "user", Content: "Question: Is there a specific type of drink you would like us to offer more often?\nReply: A banana vitamin would be awesome."},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
+	{Role: "user", Content: "Question: What's one thing you'd improve at our coffee shop?\nReply: I don't know, maybe better chairs I guess"},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Comfier seating — good call."}`},
+	{Role: "user", Content: "Question: What's one thing you'd like to see improved at our coffee shop?\nReply: Nothing that comes to my mind actually."},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, got it."}`},
+	{Role: "user", Content: "Question: How was the service?\nReply: The waiter was very educated and gentle with us."},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
+	{Role: "user", Content: "Question: What do you think of our scented candles?\nReply: Sorry, what was the question?"},
+	{Role: "assistant", Content: `{"intent":"repeat","sufficient":false,"clarity":"clear","ack":""}`},
+	{Role: "user", Content: "Question: How would you rate the quality of our coffee?\nReply: Do you expect some score or something?"},
+	{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"No need for a score — just your honest gut feeling."}`},
+	{Role: "user", Content: "Question: What's one thing you'd improve about our candles?\nReply: Hmm, I'm not really sure what you're looking for here."},
+	{Role: "assistant", Content: `{"intent":"needs_help","sufficient":false,"clarity":"clear","ack":"However you'd like to answer is fine — big or small."}`},
+	{Role: "user", Content: "Question: What could we improve about the app?\nReply: No, I can't think of anything right now."},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"All good there, noted."}`},
+	{Role: "user", Content: "Question: How has our app been working for you lately?\nReply: Eh, I dunno, it's, like, mostly fine I guess, you know?"},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"clear","ack":"Mostly smooth — good to hear."}`},
+	{Role: "user", Content: "Question: What would make you shop with us more?\nReply: You should make more advertising, I never see your publicity anywhere."},
+	{Role: "assistant", Content: `{"intent":"answer","sufficient":true,"clarity":"unclear","ack":""}`},
+	{Role: "user", Content: "Question: How likely are you to recommend us?\nReply: I really have to run now, sorry."},
+	{Role: "assistant", Content: `{"intent":"wants_stop","sufficient":false,"clarity":"clear","ack":""}`},
+	{Role: "user", Content: "Question: What's your favorite scent?\nReply: What time do you close today?"},
+	{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"No worries —"}`},
+	{Role: "user", Content: "Question: How often do you burn candles at home?\nReply: Did you catch the game last night?"},
+	{Role: "assistant", Content: `{"intent":"off_topic","sufficient":false,"clarity":"clear","ack":"Ha, no worries —"}`},
+	{Role: "user", Content: "Question: What do you think of our candles?\nReply: (buzzing) (buzzing)"},
+	{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
+	{Role: "user", Content: "Question: How satisfied are you with the quality of our furniture?\nReply: (coughing)"},
+	{Role: "assistant", Content: `{"intent":"unintelligible","sufficient":false,"clarity":"unclear","ack":""}`},
 }
 
 // nonSpeechAnnot matches a parenthesized or bracketed span, e.g. "(coughing)"
@@ -404,14 +447,7 @@ const classifySystem = "You classify a survey respondent's spoken reply on TWO a
 // Not a semantic version: it's content-addressed, so it can't drift out of sync
 // with the prompt the way a hand-bumped number would.
 func ClassifyPromptVersion() string {
-	_, shots := classifyPrompt("", "")
-	h := sha256.New()
-	h.Write([]byte(classifySystem))
-	for _, m := range shots {
-		h.Write([]byte(m.Role))
-		h.Write([]byte(m.Content))
-	}
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	return ClassifyPrompt.Resolve().Fingerprint()
 }
 
 // ClassifyTurn (Ollama backend) reads a respondent reply in the context of the

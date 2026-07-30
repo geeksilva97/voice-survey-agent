@@ -477,7 +477,7 @@ in `internal/llm`, so the rest of the app is unaware tracing exists.
 | `greeting_reply`, `closing_line` | the Closer `llm.Completer` | one shared wrapper; told apart by `obs.WithLabel` |
 | `insight_scoring` | the insight `llm.Completer` | one-shot results pass |
 | `stt`, `tts` | `speech.Engine` via `obs.StartOp` | latency + payload bytes; these take no `context`, so they're traced at the call site |
-| prompt versions | `llm.ClassifyPromptVersion`, `ws.ClosingPromptVersion` | content hashes stamped on the span, so a score movement is attributable to a prompt edit rather than guessed at |
+| prompt versions | `obs.WithPrompt` / `prompt.Resolved` | content fingerprint always stamped, plus the native `langfuse.observation.prompt.*` link when the prompt came from Langfuse — so a score movement is attributable to a prompt edit rather than guessed at |
 | `qa_persona_reply` | the dev-only `-qa` endpoint | the simulated respondent, not the agent |
 
 Still untraced: question generation (`GenerateSurvey`). Anything driving the
@@ -635,6 +635,96 @@ e.g. Langfuse Cloud):
 
 > Not wired into `validate.sh` on purpose: the gate must stay offline and must not
 > depend on a running container. Tracing is always opt-in.
+
+### Prompt management — two sources (`internal/prompt`, `-prompts`)
+
+Every LLM instruction is declared once in `internal/prompt` and resolved at use
+time, so the active text can come from the binary **or** from Langfuse Prompt
+Management. Full design in [docs/PROMPTS.md](docs/PROMPTS.md).
+
+| Mode | Source | Used by |
+|---|---|---|
+| `-prompts=code` (default) | compiled-in `Def`s | the gate, both evals, all offline work |
+| `-prompts=langfuse` | `GET /api/public/v2/prompts/{name}?label=` at boot | prompt experiments |
+
+Five prompts are registered: `classify-turn`, `question-gen`, `closing-line`,
+`greeting-reply`, `insight-score`.
+
+**The refactor is behavior-neutral, and that was measured, not assumed.** Moving
+five prompts from Go constants into the registry is exactly the kind of change that
+silently alters a prompt and invalidates every baseline in this file. Each prompt was
+dumped at runtime on this branch and on `main` and compared byte-for-byte:
+
+| Prompt | How it was captured on both trees | Result |
+|---|---|---|
+| `classify-turn` | `classifyPrompt(q, r)` — system + all 15 few-shots + the turn | identical (99 lines) |
+| `question-gen` | `GenerateSurvey` driven against a recording fake at `OLLAMA_HOST`, capturing the real request body | identical (15 lines) |
+| `closing-line` | `ClosingSystem`/`ClosingUserPrompt` vs. `ResolveClosing` | identical (14 lines) |
+| `greeting-reply` | `greetingReplySystem(...)`, both the populated and all-blank cases | identical |
+| `insight-score` | `system` + `buildPrompt(in)` vs. `ScorePrompt` + `promptVars(in)` | identical (29 lines) |
+
+Corroborated by the gate: the intent eval reports **95.1% / 95.7%** — the same
+numbers as the pre-refactor baseline recorded above.
+
+**What the tests cover** (`go test ./...`, no credentials needed):
+
+- `internal/prompt` — `{{var}}` substitution incl. `{{ spaced }}`, unknown
+  placeholders left visible rather than blanked, fingerprint stability/length/
+  sensitivity, role splitting (`System`/`LastUser`/`Chat`), `Install` replacing and
+  `Reset` restoring, and the rejection paths.
+- `internal/obs` — a 404 treated as "not yet pushed" rather than an error, text-type
+  prompts refused, `EnsurePrompt` skipping identical content, ignoring whitespace-only
+  drift, and creating on real drift with the right label + commit message.
+- `cmd/prompts` — the only test binary importing all five prompt packages, so it
+  holds the whole-registry checks: every declared var is used, no undeclared
+  placeholder exists, names are namespaced, descriptions are non-empty, and the
+  registry count matches the `-expect` default.
+- `cmd/prompts` round-trip against an in-process fake Langfuse: push creates v1 →
+  **second push creates nothing** (content-idempotent) → load installs v1 and the
+  fingerprint is unchanged → a simulated UI edit to v2 is picked up by
+  `ws.ResolveClosing` → an edit that drops `{{transcript}}` is **rejected** and
+  leaves the compiled-in default active.
+
+**Fail-fast, unlike tracing.** A trace export failure degrades with a log line; a
+prompt load failure is **fatal**. Verified by hand:
+
+```
+$ go run ./cmd/server -prompts=s3
+-prompts: unknown prompt mode "s3" (want "code" or "langfuse")
+$ go run ./cmd/server -prompts=langfuse          # no credentials
+-prompts=langfuse needs LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY
+$ go run ./cmd/prompts list                      # no credentials
+LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are not set — nothing to talk to
+```
+
+Losing a trace costs a data point; loading the wrong prompt invalidates the run.
+
+**Verified against the real local stack** (`~/projects/langfuse-local`, 2026-07-30):
+
+| Step | Result |
+|---|---|
+| `prompts list` before any push | all five `not in langfuse` |
+| `prompts push` | five `NEW VERSION` at v1, label `production` |
+| `prompts push` again | five `unchanged` — content-idempotent against the real API |
+| `prompts list` | all five `v1` / `in sync` |
+| `server -prompts=langfuse` | boots, logs all five installed from label `production` |
+| `evalclosing -prompts=langfuse` | 15/15 cases linked; run named `qwen2.5:3b@800a15685b33` |
+
+The eval's run name carries the **same fingerprint as the compiled-in prompt**
+(`800a15685b33`), which is the round-trip proof: pushing and re-fetching returned
+byte-identical text. And it reproduced the documented post-fix numbers exactly —
+MODEL clean opener **86.7%**, tic cases **75.0%**, FINAL **100%** — while running the
+prompt served by Langfuse rather than the one compiled in.
+
+`-prompts` is accepted by **all three** binaries (`cmd/server`, `cmd/eval`,
+`cmd/evalclosing`) via one shared `obs.SetupPrompts`. That sharing is deliberate: an
+eval that silently scored the compiled-in prompt while the server ran the Langfuse
+one would produce numbers for a prompt nobody is using.
+
+Still unexercised: an actual **edit made in the Langfuse UI** being picked up. The
+mechanism is covered by the fake-Langfuse round-trip above (a simulated v2 edit is
+resolved, and one that drops `{{transcript}}` is rejected), but no human-authored
+edit has been round-tripped yet.
 
 ### Phase-0 backbone spike (run if speech/models change)
 

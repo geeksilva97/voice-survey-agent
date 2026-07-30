@@ -20,8 +20,6 @@ package ws
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -34,6 +32,7 @@ import (
 
 	"voicesurvey/internal/llm"
 	"voicesurvey/internal/obs"
+	"voicesurvey/internal/prompt"
 	"voicesurvey/internal/session"
 	"voicesurvey/internal/speech"
 	"voicesurvey/internal/survey"
@@ -444,10 +443,11 @@ func (cv *conversation) personalClose() string {
 	ctx := obs.WithLabel(cv.ctx, "closing_line")
 	// Stamp WHICH closing prompt produced this line, so a before/after in Langfuse
 	// splits by prompt version instead of being guessed at.
-	ctx = obs.WithPromptVersion(ctx, ClosingPromptVersion())
+	r := ResolveClosing(cv.poll.Product, transcript)
+	ctx = obs.WithPrompt(ctx, r)
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	raw, err := cv.h.Closer.Complete(ctx, ClosingSystem, ClosingUserPrompt(cv.poll.Product, transcript))
+	raw, err := cv.h.Closer.Complete(ctx, r.System(), r.LastUser())
 	if err != nil {
 		log.Printf("personalized close degraded, using fixed line: %v", err)
 		return ""
@@ -458,22 +458,40 @@ func (cv *conversation) personalClose() string {
 	return StripFillerOpener(SanitizeClosing(raw))
 }
 
-// ClosingUserPrompt builds the user message for the closing generation.
+// ClosingPrompt is the personalized sign-off. Registered so the active version
+// can be served from Langfuse — see package prompt.
+var ClosingPrompt = prompt.Register(prompt.Def{
+	Name:        "voicesurvey/closing-line",
+	Description: "Writes the spoken farewell that references one genuine thing the respondent said. The 'do not open with a filler' clause is load-bearing — cmd/evalclosing scores exactly that.",
+	Vars:        []string{"product", "transcript"},
+	Messages: []prompt.Msg{{
+		Role:    "system",
+		Content: ClosingSystem,
+	}, {
+		Role:    "user",
+		Content: "Product: {{product}}\n\nWhat the respondent said:\n{{transcript}}\n\nWrite the closing line.",
+	}},
+})
+
+// ResolveClosing compiles the ACTIVE closing prompt for one response.
 //
-// It is exported so an offline eval drives the EXACT prompt production uses.
-// Leaving this string inlined above and re-typing it in the harness is precisely
-// how an eval silently stops measuring the real thing.
-func ClosingUserPrompt(product, transcript string) string {
-	return "Product: " + product + "\n\nWhat the respondent said:\n" + transcript + "\n\nWrite the closing line."
+// It is exported so an offline eval drives the exact prompt production uses —
+// re-typing these strings in the harness is precisely how an eval silently stops
+// measuring the real thing. Going through the handle (rather than the constant)
+// also means the eval scores a Langfuse-authored prompt when one is installed.
+func ResolveClosing(product, transcript string) prompt.Resolved {
+	return ClosingPrompt.Resolve().Compile(map[string]string{
+		"product":    product,
+		"transcript": transcript,
+	})
 }
 
 // ClosingPromptVersion is a short, stable fingerprint of the closing
 // instructions — the same device as llm.ClassifyPromptVersion. It changes exactly
-// when ClosingSystem changes, which is what lets a score movement be attributed
-// to a prompt edit rather than to noise.
+// when the active closing prompt changes, which is what lets a score movement be
+// attributed to a prompt edit rather than to noise.
 func ClosingPromptVersion() string {
-	sum := sha256.Sum256([]byte(ClosingSystem))
-	return hex.EncodeToString(sum[:])[:12]
+	return ClosingPrompt.Resolve().Fingerprint()
 }
 
 const ClosingSystem = "You are a friendly voice-survey agent wrapping up a short spoken survey. " +
@@ -741,11 +759,13 @@ func (cv *conversation) composeGreetingLead(reply, ackFallback string) string {
 	purpose := strings.TrimSpace(cv.poll.Purpose)
 	_, count := cv.sv.Progress() // total number of questions
 	if cv.h.Closer != nil {
-		ctx, cancel := context.WithTimeout(obs.WithLabel(cv.ctx, "greeting_reply"), 15*time.Second)
+		vars := greetingReplyVars(cv.h.AgentName, product, purpose, count)
+		vars["timeOfDay"] = timeOfDay(time.Now())
+		vars["reply"] = fmt.Sprintf("%q", strings.TrimSpace(reply))
+		r := GreetingReplyPrompt.Resolve().Compile(vars)
+		ctx, cancel := context.WithTimeout(obs.WithPrompt(obs.WithLabel(cv.ctx, "greeting_reply"), r), 15*time.Second)
 		defer cancel()
-		user := fmt.Sprintf("Time of day: %s.\nThey just said: %q\n\nWrite your spoken reply, ending with the hand-off into the survey.",
-			timeOfDay(time.Now()), strings.TrimSpace(reply))
-		raw, err := cv.h.Closer.Complete(ctx, greetingReplySystem(cv.h.AgentName, product, purpose, count), user)
+		raw, err := cv.h.Closer.Complete(ctx, r.System(), r.LastUser())
 		if err != nil {
 			log.Printf("greeting response degraded, using fixed framing: %v", err)
 		} else if s := sanitizeSpoken(raw, 320); s != "" {
@@ -799,11 +819,49 @@ func numberWord(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-// greetingReplySystem builds the prompt for Ava's small-talk reply. She must
-// react to what they actually said FIRST (reciprocate, acknowledge a busy day),
-// then set expectations (how many questions, what it's for) and hand off WITHOUT
-// asking the first question herself — the verbatim question is appended after.
+// GreetingReplyPrompt is Ava's small-talk reply. She must react to what they
+// actually said FIRST (reciprocate, acknowledge a busy day), then set
+// expectations (how many questions, what it's for) and hand off WITHOUT asking
+// the first question herself — the verbatim question is appended after.
+//
+// The branching that picks the phrasing for each variable stays in Go (see
+// greetingReplyVars): "two questions" vs. "a few quick questions" is a grammar
+// decision, not a prompt-authoring one, and a spoken agent cannot recover from
+// getting it wrong.
+var GreetingReplyPrompt = prompt.Register(prompt.Def{
+	Name:        "voicesurvey/greeting-reply",
+	Description: "Reacts to the respondent's answer to 'how's your day', frames the survey, and ends on a ready-check. Never asks a survey question — the first question is appended verbatim after this line.",
+	Vars:        []string{"name", "countClause", "about", "purposeClause", "reply", "timeOfDay"},
+	Messages: []prompt.Msg{{
+		Role: "system",
+		Content: "You are {{name}}, a warm, personable voice-survey host. You just said hello and asked " +
+			"how the person's day is going, and they replied. Write {{name}}'s SHORT spoken reply and hand-off. " +
+			"This is SPOKEN aloud, so keep it tight and easy to listen to — a wall of text is painful to hear. " +
+			"STRUCTURE, in this order: (1) ONE brief, genuine reaction to what they ACTUALLY said — if they " +
+			"asked how you are, answer in a few words; if they're busy, a quick nod. Don't overdo it. " +
+			"(2) ONE smooth transition into the survey — pick a single connective like \"So,\" and NEVER stack " +
+			"two (no \"so... okay, let's get into it\"). (3) In that sentence, say you've got {{countClause}} about {{about}}{{purposeClause}} " +
+			"then END BY ASKING IF THEY'RE READY to start (e.g. \"sound good?\", \"ready when you are?\"). " +
+			"HARD LIMITS: at most 2 short sentences plus the ready-check, under 35 words total, and never " +
+			"repeat a word like \"quick\" twice. Do NOT ask any of the actual survey questions and do NOT start " +
+			"answering them — only check they're ready. Natural spoken English, contractions welcome. No " +
+			"lists, no emoji, no placeholders, no stage directions. Output only the spoken words.",
+	}, {
+		Role: "user",
+		Content: "Time of day: {{timeOfDay}}.\nThey just said: {{reply}}\n\n" +
+			"Write your spoken reply, ending with the hand-off into the survey.",
+	}},
+})
+
+// greetingReplySystem renders the active greeting prompt's system block with the
+// phrasing filled in. A thin seam over the handle, kept because the system block
+// is the unit the tests assert on.
 func greetingReplySystem(name, product, purpose string, count int) string {
+	return GreetingReplyPrompt.Resolve().Compile(greetingReplyVars(name, product, purpose, count)).System()
+}
+
+// greetingReplyVars renders the phrasing the greeting prompt interpolates.
+func greetingReplyVars(name, product, purpose string, count int) map[string]string {
 	if name = strings.TrimSpace(name); name == "" {
 		name = "Ava"
 	}
@@ -819,18 +877,12 @@ func greetingReplySystem(name, product, purpose string, count int) string {
 	if purpose != "" {
 		purposeClause = ", and weave in the goal as a SHORT phrase (compress it, don't recite it word-for-word): " + purpose + "."
 	}
-	return fmt.Sprintf("You are %[1]s, a warm, personable voice-survey host. You just said hello and asked "+
-		"how the person's day is going, and they replied. Write %[1]s's SHORT spoken reply and hand-off. "+
-		"This is SPOKEN aloud, so keep it tight and easy to listen to — a wall of text is painful to hear. "+
-		"STRUCTURE, in this order: (1) ONE brief, genuine reaction to what they ACTUALLY said — if they "+
-		"asked how you are, answer in a few words; if they're busy, a quick nod. Don't overdo it. "+
-		"(2) ONE smooth transition into the survey — pick a single connective like \"So,\" and NEVER stack "+
-		"two (no \"so... okay, let's get into it\"). (3) In that sentence, say you've got %[3]s about %[2]s%[4]s "+
-		"then END BY ASKING IF THEY'RE READY to start (e.g. \"sound good?\", \"ready when you are?\"). "+
-		"HARD LIMITS: at most 2 short sentences plus the ready-check, under 35 words total, and never "+
-		"repeat a word like \"quick\" twice. Do NOT ask any of the actual survey questions and do NOT start "+
-		"answering them — only check they're ready. Natural spoken English, contractions welcome. No "+
-		"lists, no emoji, no placeholders, no stage directions. Output only the spoken words.", name, about, countClause, purposeClause)
+	return map[string]string{
+		"name":          name,
+		"about":         about,
+		"countClause":   countClause,
+		"purposeClause": purposeClause,
+	}
 }
 
 // startSurvey speaks the first question, led by the authored greeting response
