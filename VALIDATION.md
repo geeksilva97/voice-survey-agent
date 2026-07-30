@@ -465,31 +465,44 @@ secret exists only inside the encoded Basic header.
 stops the server taking calls or the eval from running (and therefore can never
 change the gate's verdict).
 
-#### Span hierarchy — one conversation is one trace
+#### Span hierarchy — one TURN is one trace
 
 Every span used to start from `context.Background()`, which carries no active span.
 A span with no parent **is** a root span, and a root span is a new trace — so a
-finished call produced ~21 separate single-observation traces, and a session was a
-flat, timestamp-ordered list with the classifier's JSON interleaved between pieces of
-spoken text. Measured on a real persona run: `21 traces, observations per trace {1}`.
+finished call produced ~21 separate single-observation traces. A session was a flat
+list where the classifier appeared as its own entry between two pieces of spoken
+text, dumping `{question, reply}` / `{intent, sufficient, clarity, ack}` tables into
+the middle of the dialogue. Measured on a real persona run:
+`21 traces, observations per trace {1}`.
 
-Two parent spans fix it — `conversation` (held open for the call, in `Serve`) and
-`turn N` (per utterance, in `handleUtterance`). The existing wrappers already thread
-the context; they just never had a parent to attach to. Same run, after:
+The fix is **one span per turn**, in `handleUtterance` — not a single
+conversation-level root. A conversation root was tried first and rejected: it
+collapses the whole call into one card and loses the per-turn separation that makes a
+session skimmable. The unit that reads well is the turn.
+
+Each turn span carries what the respondent said as input and what the agent said back
+as output (`streamTTS` is the single funnel every spoken segment passes through, so it
+is the one place that can reconstruct the latter). Verified on the real local stack:
 
 ```
-conversation                      input: product · output: end_reason + transcript
-├─ tts ×3                         the opening greeting, before any respondent turn
-├─ turn 1                         input: what STT heard
-│  └─ stt · classify_turn · greeting_reply · tts ×3
-├─ turn 2 … turn 6
-│  └─ stt · classify_turn · tts ×2
-└─ turn 7
-   └─ stt · classify_turn · closing_line · tts ×2
+top-level cards: 7
+  tts      obs=1  in='Hi there!'
+  tts      obs=1  in="I'm Ava."
+  tts      obs=1  in="How's your afternoon going so far?"
+  turn 1   obs=7  in='Pretty good, thanks kind of in a rush though.'
+                  out="Got it, I'll keep us moving quickly! I've got five q…"
+  turn 2   obs=5  in="Sure, go ahead, but I've only got a minute."
+                  out="Quick and easy, let's go. How do you like the scent…"
+  turn 3   obs=6  in="They're nice, pretty strong and long lasting…"
+                  out='Strong and long-lasting, noted. On a scale from 1 to…'
+  turn 4   obs=5  in='Sorry, I really have to run, thanks though.'
+                  out='No problem at all — thanks so much for the time you…'
 ```
 
-**1 trace, 41 observations** — verified via `/api/public/observations` on the real
-local stack, reconstructing the parent chain.
+`stt`, `classify_turn`, `greeting_reply`, `closing_line` and the `tts` calls all nest
+inside the turn they belong to, so the classifier's JSON is one expand away instead of
+interrupting the transcript. The three leading `tts` cards are the opening greeting,
+which happens before any respondent turn.
 
 Span creation funnels through one `startSpan` helper because of a trap worth
 recording: `langfuse.trace.name` and `langfuse.session.id` are **trace-level**
@@ -499,10 +512,9 @@ child would rename the entire conversation after whichever leaf wrote last. So o
 span that actually begins a new trace claims the name
 (`!trace.SpanContextFromContext(ctx).IsValid()`).
 
-Tradeoff: the `conversation` span exports only when the call ends, so nothing appears
-in Langfuse mid-conversation. Accepted — for 1–3 minute calls, a readable trace beats
-watching spans trickle in. (A call that never ends leaves the root span unexported;
-its turn spans still arrive, since OTel exports each span as it ends.)
+Tradeoff: a turn's span exports only once the turn finishes, so the card for the turn
+in flight is not there yet. Far milder than the conversation-root version, which showed
+nothing at all until the whole call ended.
 
 **The `confused` persona test is marginal, and this hierarchy is what proved it.**
 While validating the change, `confused triggers needs_help, then completes` failed on
@@ -533,7 +545,7 @@ in `internal/llm`, so the rest of the app is unaware tracing exists.
 
 | Span | Source | Notes |
 |---|---|---|
-| `conversation`, `turn N` | `obs.StartScope` in `internal/ws` | the parents everything below nests under; `conversation` carries the transcript + end reason |
+| `turn N` | `obs.StartScope` in `internal/ws` | one per utterance; parents that turn's stt/classify/tts, and carries respondent-said as input, agent-said as output |
 | `classify_turn` | `llm.Classifier` (wrapped once) | covers all 3 `ws` call sites + the eval |
 | `greeting_reply`, `closing_line` | the Closer `llm.Completer` | one shared wrapper; told apart by `obs.WithLabel` |
 | `insight_scoring` | the insight `llm.Completer` | one-shot results pass |
