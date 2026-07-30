@@ -1,8 +1,12 @@
 package obs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +27,67 @@ func TestInitDisabledWithoutKeys(t *testing.T) {
 	}
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("noop shutdown: %v", err)
+	}
+}
+
+// captureLog redirects the standard logger for one test and returns what was
+// written. Init's warnings go through log, so this is how they're asserted.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	flags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+	return &buf
+}
+
+// A silently untraced run is indistinguishable from a healthy traced one until
+// you're staring at an empty dashboard — and by then the conversation is gone,
+// because there's no way to trace it after the fact. So the disabled path must
+// SAY so.
+func TestInitWarnsWhenKeysAreMissing(t *testing.T) {
+	buf := captureLog(t)
+	t.Setenv("LANGFUSE_PUBLIC_KEY", "")
+	t.Setenv("LANGFUSE_SECRET_KEY", "")
+	if _, enabled, _ := Init(context.Background()); enabled {
+		t.Fatal("tracing enabled without credentials")
+	}
+	got := buf.String()
+	if !strings.Contains(got, "DISABLED") {
+		t.Errorf("no disabled warning logged; got %q", got)
+	}
+	// The warning has to name the fix, not just the symptom.
+	if !strings.Contains(got, "with-langfuse.sh") {
+		t.Errorf("warning should point at the wrapper that sets the keys; got %q", got)
+	}
+}
+
+// Half-configured is a different message on purpose: no keys at all is the normal
+// offline case, but exactly one key set is always a mistake and should read like one.
+func TestInitWarnsDifferentlyOnHalfConfigured(t *testing.T) {
+	for _, tc := range []struct{ name, pk, sk, want string }{
+		{"secret missing", "pk-lf-test", "", "LANGFUSE_SECRET_KEY"},
+		{"public missing", "", "sk-lf-test", "LANGFUSE_PUBLIC_KEY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLog(t)
+			t.Setenv("LANGFUSE_PUBLIC_KEY", tc.pk)
+			t.Setenv("LANGFUSE_SECRET_KEY", tc.sk)
+			if _, enabled, _ := Init(context.Background()); enabled {
+				t.Fatal("tracing enabled with only one key")
+			}
+			got := buf.String()
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("warning should name the empty key %s; got %q", tc.want, got)
+			}
+			if !strings.Contains(got, "misconfiguration") {
+				t.Errorf("half-configured should read as a mistake, not an offline run; got %q", got)
+			}
+		})
 	}
 }
 

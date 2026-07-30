@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"os"
 	"strings"
 
@@ -49,6 +50,20 @@ func Init(ctx context.Context) (shutdown func(context.Context) error, enabled bo
 	pk := strings.TrimSpace(os.Getenv("LANGFUSE_PUBLIC_KEY"))
 	sk := strings.TrimSpace(os.Getenv("LANGFUSE_SECRET_KEY"))
 	if pk == "" || sk == "" {
+		// Say so out loud. A silently untraced run is indistinguishable from a
+		// healthy traced one until you go looking at an empty dashboard, and by then
+		// the conversation is gone — there is no way to trace it after the fact.
+		// Half-configured is called out separately because it is always a mistake,
+		// where neither key set is the normal offline case.
+		if pk == "" && sk == "" {
+			log.Printf("langfuse: tracing DISABLED — LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set, nothing will be exported (run under ./scripts/with-langfuse.sh to enable)")
+		} else {
+			missing := "LANGFUSE_PUBLIC_KEY"
+			if sk == "" {
+				missing = "LANGFUSE_SECRET_KEY"
+			}
+			log.Printf("langfuse: tracing DISABLED — %s is empty and both keys are required; this looks like a misconfiguration rather than an offline run", missing)
+		}
 		return noop, false, nil
 	}
 
@@ -300,6 +315,17 @@ func (o *Operation) Out(v string) *Operation {
 // Bytes records a payload size, so audio volume can be read next to latency.
 func (o *Operation) Bytes(key string, n int) *Operation {
 	o.span.SetAttributes(attribute.Int(key, n))
+	return o
+}
+
+// Meta records a value Langfuse surfaces as trace metadata and can filter on.
+//
+// This is where anything that VARIES per occurrence belongs — an index, an id, a
+// status. Putting it in the span NAME instead fragments the name into one value per
+// occurrence, and the name is the field Langfuse aggregates by, so per-name latency
+// and cost stop grouping.
+func (o *Operation) Meta(key, value string) *Operation {
+	o.span.SetAttributes(attribute.String("langfuse.trace.metadata."+key, value))
 	return o
 }
 

@@ -229,6 +229,37 @@ Anthropic key is loaded server-side and never appears in the suite.
 
 ---
 
+## Tracing a QA run to Langfuse
+
+A persona run is a real conversation, so it produces the most useful Langfuse
+session you can get — every turn, with STT/classify/TTS latency and the ending
+decision. It is also the easiest thing to accidentally lose: **tracing is off unless
+the server process has the keys**, and a server without them behaves identically in
+every visible way.
+
+Both harnesses launch or reuse a server, so the keys have to be present when *that
+process* starts:
+
+```bash
+# Playwright (spawns its own server on :8091 — inherits your shell, sets no env itself)
+./scripts/with-langfuse.sh bash -c 'cd scripts/browser-e2e/playwright && npx playwright test'
+
+# Chrome DevTools MCP flow (drives the dev server on :8090 that YOU started)
+./scripts/with-langfuse.sh go run ./cmd/server -qa
+```
+
+The startup log is the tell:
+
+```
+langfuse tracing enabled -> http://localhost:3001     # traced
+langfuse: tracing DISABLED — LANGFUSE_… not set       # NOT traced
+```
+
+Traces can't be reconstructed after the run, so check the line before spending a
+conversation you wanted to inspect.
+
+---
+
 ## What this covers — and what it doesn't
 
 **Covered (faithfully):** endpointing decisions, STT on synthesized speech, the

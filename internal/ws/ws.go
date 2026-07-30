@@ -25,6 +25,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -145,7 +146,7 @@ type conversation struct {
 	sv   *survey.Survey
 	ctx  context.Context // session-scoped base context (carries the session id AND the conversation span)
 
-	turns int      // utterances so far, so each turn span gets a readable name
+	turns int      // utterances so far; stamped on each turn span as turn_index metadata
 	said  []string // what the agent spoke during the current turn (for the turn span's output)
 
 	speaking      bool // true while we expect the client to be playing audio
@@ -247,9 +248,54 @@ func (cv *conversation) run() {
 				cv.endSurveyBySilence()
 				return
 			}
-			cv.speak("Are you still there? Take your time — whenever you're ready.", "reprompt")
+			// Named so silence nudges are countable in Langfuse — this is the
+			// backstop the ending thesis rests on, and it should be visible as its
+			// own phase rather than an anonymous tts.
+			cv.scoped("reprompt", func() {
+				cv.speak("Are you still there? Take your time — whenever you're ready.", "reprompt")
+			})
 			// speak() sets speaking=true; playback_done will re-arm the timer.
 		}
+	}
+}
+
+// scoped runs fn under a named top-level span, so the agent-initiated phases (the
+// opening hello, a silence nudge) appear as one meaningfully-named trace instead of
+// a scatter of anonymous tts entries. Whatever fn speaks becomes the span's output.
+//
+// Saves and restores both the context and the spoken-text buffer, so a scope can
+// never nest inside — or clobber the output of — the turn that surrounds it.
+func (cv *conversation) scoped(name string, fn func()) {
+	base, prevSaid := cv.ctx, cv.said
+	scope, ctx := obs.StartScope(base, name)
+	cv.ctx, cv.said = ctx, nil
+	fn()
+	spoken := strings.Join(cv.said, " ")
+	cv.ctx, cv.said = base, prevSaid
+	scope.Out(spoken).End()
+}
+
+// phaseName is the trace name for the turn about to be handled: which beat of the
+// conversation this utterance belongs to. Derived from the same state-machine flags
+// the ending logic uses, so the trace list reads as the conversation's shape —
+// greeting_reply → ready_check → survey_turn ×N, with repair where one fired.
+//
+// Deliberately a CLOSED set: these are names you filter and aggregate by, so a new
+// one should mean a genuinely new conversational phase, not a variation of an
+// existing one.
+func (cv *conversation) phaseName() string {
+	switch {
+	case cv.inGreeting:
+		// Not "greeting_reply" — that name already belongs to the LLM generation
+		// nested inside this turn, and a trace sharing a name with its own child
+		// makes both unreadable in a filter.
+		return "greeting_turn"
+	case cv.awaitingStart:
+		return "ready_check"
+	case cv.awaitingConfirm:
+		return "repair"
+	default:
+		return "survey_turn"
 	}
 }
 
@@ -264,9 +310,18 @@ func (cv *conversation) handleUtterance(pcm []byte) bool {
 	// Deliberately NOT parented to a conversation-level span: a single root would
 	// collapse the whole call into one card and lose the per-turn separation.
 	// Restored via defer so the next turn is a sibling, not a child of its predecessor.
+	// Named after the CONVERSATIONAL PHASE this turn belongs to, not "turn N". The
+	// name is what Langfuse aggregates and filters by, so it has to be a small set
+	// of stable, meaningful values: an index in the name fragments it into one value
+	// per position and per-phase latency/cost can never group. The ordinal goes in
+	// metadata, where varying values belong.
+	//
+	// The phase is already known from the state machine's flags on entry, which is
+	// the point — these are the same states the ending logic reasons about.
 	cv.turns++
 	base := cv.ctx
-	turnSpan, ctx := obs.StartScope(base, fmt.Sprintf("turn %d", cv.turns))
+	turnSpan, ctx := obs.StartScope(base, cv.phaseName())
+	turnSpan.Meta("turn_index", strconv.Itoa(cv.turns))
 	cv.ctx = ctx
 	cv.said = nil
 	defer func() {
@@ -617,7 +672,12 @@ const greetingQuestion = "How's your day going so far?"
 func (cv *conversation) openGreeting() {
 	cv.inGreeting = true
 	line := greetingLine(cv.h.AgentName, timeOfDay(time.Now()))
-	cv.emit(outMsg{Type: "agent_say", Text: line, Kind: "greeting"}, line)
+	// Scoped so the opening hello is ONE named trace instead of three bare tts
+	// entries — the greeting is a phase of the conversation, and the trace name
+	// should say which phase it is.
+	cv.scoped("greeting", func() {
+		cv.emit(outMsg{Type: "agent_say", Text: line, Kind: "greeting"}, line)
+	})
 }
 
 // greetingTemplates are curated spoken openers — just a warm, human hello: the

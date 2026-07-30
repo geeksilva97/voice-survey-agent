@@ -465,6 +465,29 @@ secret exists only inside the encoded Basic header.
 stops the server taking calls or the eval from running (and therefore can never
 change the gate's verdict).
 
+**But never silent, either.** `obs.Init` logs when tracing is **disabled**, because a
+silently untraced run is indistinguishable from a healthy traced one until you're
+looking at an empty dashboard — and by then the conversation is gone, since traces
+cannot be reconstructed after the fact. This cost real runs before the warning
+existed: a poll driven through `:8090` and a whole `npm test` persona suite, both
+started without the keys, both invisible.
+
+```
+langfuse: tracing DISABLED — LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set,
+  nothing will be exported (run under ./scripts/with-langfuse.sh to enable)
+```
+
+Exactly one key set gets a *different* message naming the empty one and calling it a
+misconfiguration — no keys is the normal offline case, one key never is. Both messages
+are asserted by `TestInitWarnsWhenKeysAreMissing` and
+`TestInitWarnsDifferentlyOnHalfConfigured`, including that the first one names the
+wrapper rather than just the symptom.
+
+The wrapper requirement is now documented where it's actually needed:
+`docs/BROWSER-QA.md` and `scripts/browser-e2e/playwright/README.md` — neither
+previously mentioned that a plain `npm test` exports nothing (its `webServer` block
+passes no `env`, so it inherits a shell that sets no `LANGFUSE_*`).
+
 #### Span hierarchy — one TURN is one trace
 
 Every span used to start from `context.Background()`, which carries no active span.
@@ -482,27 +505,46 @@ session skimmable. The unit that reads well is the turn.
 
 Each turn span carries what the respondent said as input and what the agent said back
 as output (`streamTTS` is the single funnel every spoken segment passes through, so it
-is the one place that can reconstruct the latter). Verified on the real local stack:
+is the one place that can reconstruct the latter).
+
+**Trace names are the conversational PHASE, not an index.** The name is the field
+Langfuse aggregates and filters by, so it has to be a small closed set of stable
+values: `turn 1`…`turn N` fragments it into one name per position and per-phase
+latency/cost can never group. The ordinal lives in `turn_index` metadata instead —
+anything that varies per occurrence belongs there (`Operation.Meta`).
+
+The names come from `cv.phaseName()`, which reads the same state-machine flags the
+ending logic reasons about, so the trace list and the state machine cannot drift apart:
+
+| name | when |
+|---|---|
+| `greeting` | the agent's opening hello (scoped, so it is one trace and not three bare `tts`) |
+| `greeting_turn` | `inGreeting` — their reply to "how's your day" plus the framing (**not** `greeting_reply`: that name belongs to the LLM generation nested inside, and a trace sharing a name with its own child is unreadable in a filter) |
+| `ready_check` | `awaitingStart` — the consent beat before Q1 |
+| `survey_turn` | a question/answer exchange |
+| `repair` | `awaitingConfirm` — the clarify-once turn |
+| `reprompt` | a silence nudge — named so the backstop the ending thesis rests on is countable |
+
+Verified on the real local stack (enthusiast persona, completed):
 
 ```
-top-level cards: 7
-  tts      obs=1  in='Hi there!'
-  tts      obs=1  in="I'm Ava."
-  tts      obs=1  in="How's your afternoon going so far?"
-  turn 1   obs=7  in='Pretty good, thanks kind of in a rush though.'
-                  out="Got it, I'll keep us moving quickly! I've got five q…"
-  turn 2   obs=5  in="Sure, go ahead, but I've only got a minute."
-                  out="Quick and easy, let's go. How do you like the scent…"
-  turn 3   obs=6  in="They're nice, pretty strong and long lasting…"
-                  out='Strong and long-lasting, noted. On a scale from 1 to…'
-  turn 4   obs=5  in='Sorry, I really have to run, thanks though.'
-                  out='No problem at all — thanks so much for the time you…'
+total: 5 | names: {greeting: 1, greeting_turn: 1, ready_check: 1, survey_turn: 2}
+  greeting        idx=-   obs=4
+  greeting_turn   idx=1   obs=6
+  ready_check     idx=2   obs=5
+  survey_turn     idx=3   obs=5
+  survey_turn     idx=4   obs=6
 ```
 
 `stt`, `classify_turn`, `greeting_reply`, `closing_line` and the `tts` calls all nest
-inside the turn they belong to, so the classifier's JSON is one expand away instead of
-interrupting the transcript. The three leading `tts` cards are the opening greeting,
-which happens before any respondent turn.
+inside the phase they belong to, so the classifier's JSON is one expand away instead of
+interrupting the transcript.
+
+Not yet seen in a live trace: `repair` and `reprompt`. They share the same code path as
+the names above, but the enthusiast persona triggers neither (`repair` needs an
+`unclear` answer, which the `confused` persona produces — the flaky one). There is also
+no `closing` name: the closing line is generated *inside* the last `survey_turn`, so
+`closing_line` is a nested observation rather than its own trace.
 
 Span creation funnels through one `startSpan` helper because of a trap worth
 recording: `langfuse.trace.name` and `langfuse.session.id` are **trace-level**

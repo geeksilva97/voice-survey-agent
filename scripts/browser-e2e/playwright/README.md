@@ -19,6 +19,32 @@ npm test               # build server (-qa), run all four personas, assert outco
 dedicated port (default **8091**, so it never touches a dev server on :8090), runs
 each persona end-to-end, and tears the server down.
 
+### Tracing a persona run to Langfuse
+
+A persona run is a real conversation — full VAD, STT, classifier, TTS and ending
+logic — so it makes an excellent Langfuse trace. But **plain `npm test` is
+untraced**: the `webServer` block passes no `env`, so it inherits your shell, and
+nothing there sets `LANGFUSE_*`. The server starts, works perfectly, and exports
+nothing.
+
+Run it under the wrapper to get traces:
+
+```bash
+cd ../../..                       # repo root (poc/)
+./scripts/with-langfuse.sh bash -c 'cd scripts/browser-e2e/playwright && npx playwright test'
+```
+
+Confirm it took by looking for this in the piped server output — if the line is
+absent, nothing is being exported:
+
+```
+[WebServer] langfuse tracing enabled -> http://localhost:3001
+```
+
+Without the keys the server now says so explicitly (`langfuse: tracing DISABLED …`),
+which is the tell that a run you expected to see in the dashboard won't be there.
+Traces cannot be recovered after the fact.
+
 ## What it asserts
 
 Outcomes, not exact words (answers are generated fresh each run):
